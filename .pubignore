@@ -1,0 +1,8 @@
+# Files excluded from the pub.dev package.
+# The benchmark corpus and the Rust reference harness are development-only.
+
+.agents/
+.github/
+benchmark/
+build/
+coverage/

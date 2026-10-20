@@ -1,0 +1,17 @@
+[package]
+name = "zstd_ref"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Dev-only reference encoder/decoder and fixture generator for the pure-Dart zstd_neo codec"
+license = "MIT"
+repository = "https://github.com/unk-404/dart_zstd"
+
+[dependencies]
+# Reference implementation for interoperability fixtures and benchmarks.
+# This crate is developer tooling only: nothing under `lib/` or the default
+# `dart test` path may depend on Rust.
+zstd = "0.14"
+
+[profile.release]
+opt-level = 3

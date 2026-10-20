@@ -1,0 +1,18 @@
+# Keep text files LF everywhere; fixtures and corpus are binary.
+* text=auto eol=lf
+
+*.dart text eol=lf
+*.md text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.toml text eol=lf
+*.rs text eol=lf
+*.lock text eol=lf
+
+*.zst binary
+*.bin binary
+*.dict binary
+benchmark/corpus/silesia/* binary
+
+*.png binary
+*.svg text eol=lf

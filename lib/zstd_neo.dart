@@ -1,8 +1,10 @@
-/// Support for doing something awesome.
+/// Pure Dart Zstandard (zstd) codec.
 ///
-/// More dartdocs go here.
+/// A complete decoder and a streaming encoder for the Zstandard frame format,
+/// usable on the Dart VM, dart2js and dart2wasm.
 library;
 
-export 'src/zstd_neo_base.dart';
-
-// TODO: Export any libraries intended for clients of this package.
+export 'src/codec.dart' show ZstdCodec;
+export 'src/common/errors.dart' show ZstdErrorCode, ZstdException;
+export 'src/compress/encoder.dart' show ZstdEncoder;
+export 'src/decompress/decoder.dart' show ZstdDecoder;

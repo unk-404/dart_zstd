@@ -1,0 +1,22 @@
+zstd_neo is an independent, from-scratch implementation of the Zstandard
+compression format in Dart. It is not derived from the reference C source
+code, but it follows the public format specification:
+
+  https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md
+
+Third-party material:
+
+1. test/fixtures/*.zst and test/fixtures/*.bin
+   Generated with, or copied from, the reference Zstandard project
+   (https://github.com/facebook/zstd), Copyright (c) Meta Platforms, Inc.
+   and affiliates, licensed under the BSD 3-Clause License:
+   https://github.com/facebook/zstd/blob/dev/LICENSE
+
+   The files are used only as interoperability test vectors.
+
+2. benchmark/corpus/silesia/*
+   The Silesia compression corpus, by Sebastian Deorowicz:
+   http://sun.aei.polsl.pl/~sdeor/corpus/silesia.zip
+   The files keep their original provenance and licenses; see
+   benchmark/corpus/README.md. This corpus is development-only and is
+   excluded from the published package via .pubignore.
