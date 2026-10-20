@@ -45,9 +45,10 @@ takes the same optional `--dictionary`.
 
 `gen-fixtures` writes the deterministic fixture matrix (levels, checksum,
 content-size, multi-frame, skippable, raw/structured dictionaries), copies the
-official zstd golden/error samples when `.agents/zstd/tests` is available, and
-regenerates `test/fixtures/fixtures.g.dart`. It decodes every frame with
-libzstd and aborts on any mismatch, so the fixture set is self-checking.
+official zstd golden/error samples when a local zstd test checkout is provided
+via `--zstd-tests`, and regenerates `test/fixtures/fixtures.g.dart`. It decodes
+every frame with libzstd and aborts on any mismatch, so the fixture set is
+self-checking.
 
 ```text
 # from the repository root
@@ -57,9 +58,9 @@ dart format test/fixtures/fixtures.g.dart
 
 Paths in `gen-fixtures` default to the repository layout
 (`--out test/fixtures`, `--corpus benchmark/corpus/silesia`,
-`--zstd-tests .agents/zstd/tests`); pass `--corpus`/`--zstd-tests` when running
+`--zstd-tests test/zstd-tests`); pass `--corpus`/`--zstd-tests` when running
 from elsewhere. Missing official zstd vectors only produce a warning, so the
-crate can be built and used by CI without the gitignored `.agents/` checkout.
+crate can be built and used by CI without a zstd source checkout.
 
 ## Why no `clap`?
 
