@@ -94,6 +94,9 @@ jobs:
           config: benchmark/benchcat.toml
           format: jsonl
           out: assets/benchmarks.svg
+          font_file: assets/fonts/mplus-rounded.ttf
+        env:
+          BENCHCAT_FONT_DIR: assets/fonts
       - name: Commit the refreshed card
         if: github.ref_type == 'branch'
         run: |

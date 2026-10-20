@@ -7,6 +7,9 @@
 #
 # Inputs are repository-relative.
 
+[font]
+family = "mplus-rounded"
+
 [render]
 title = "zstd_neo vs zstd-rs"
 subtitle = "{platform} · commit {commit:short}"
@@ -15,6 +18,7 @@ missing = "skip"
 max_rows = 24
 bar_scale = "row"
 bar_curve = "linear"
+kaomoji = "(^_^)"
 
 [[series]]
 label = "Pure Dart (AOT)"

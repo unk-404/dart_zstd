@@ -15,4 +15,5 @@
 benchmark/corpus/silesia/* binary
 
 *.png binary
+*.ttf binary
 *.svg text eol=lf
