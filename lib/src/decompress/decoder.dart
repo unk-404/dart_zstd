@@ -20,10 +20,7 @@ final class ZstdDecoder extends Converter<List<int>, List<int>> {
     this.maxWindowSize = zstdDefaultMaxWindowSize,
     this.verifyChecksum = true,
     this.maxOutputSize,
-  }) : assert(
-         maxOutputSize == null || maxOutputSize >= 0,
-         'maxOutputSize must be non-negative',
-       );
+  });
 
   /// Optional Zstandard dictionary (formatted or raw content).
   final Uint8List? dictionary;
@@ -46,6 +43,7 @@ final class ZstdDecoder extends Converter<List<int>, List<int>> {
 
   /// Fast path: decompress a contiguous byte buffer.
   Uint8List decompress(Uint8List input) {
+    _checkConfiguration();
     try {
       return _decompressAll(input);
     } on ZstdException {
@@ -63,8 +61,21 @@ final class ZstdDecoder extends Converter<List<int>, List<int>> {
       decompress(input is Uint8List ? input : Uint8List.fromList(input));
 
   @override
-  ByteConversionSink startChunkedConversion(Sink<List<int>> sink) =>
-      _ZstdDecodingSink(this, sink);
+  ByteConversionSink startChunkedConversion(Sink<List<int>> sink) {
+    _checkConfiguration();
+    return _ZstdDecodingSink(this, sink);
+  }
+
+  /// Validates options that the const constructor can only assert.
+  ///
+  /// `assert` is disabled in release builds, so a negative output limit would
+  /// otherwise silently poison every decode. Fail loudly instead.
+  void _checkConfiguration() {
+    final limit = maxOutputSize;
+    if (limit != null && limit < 0) {
+      throw ArgumentError.value(limit, 'maxOutputSize', 'must be non-negative');
+    }
+  }
 
   ParsedDictionary? _parseDictionary() {
     final bytes = dictionary;

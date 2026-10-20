@@ -91,6 +91,21 @@ void main() {
       );
     });
 
+    test('rejects a negative maxOutputSize at use time', () {
+      final frame = Uint8List.fromList(
+        const ZstdCodec().encode(utf8.encode('negative limit')),
+      );
+      expect(
+        () => ZstdDecoder(maxOutputSize: -1).decompress(frame),
+        throwsArgumentError,
+      );
+      expect(
+        () => ZstdDecoder(maxOutputSize: -1)
+            .startChunkedConversion(ByteConversionSink.withCallback((_) {})),
+        throwsArgumentError,
+      );
+    });
+
     test('rejects garbage', () {
       expect(
         () => const ZstdDecoder().decompress(Uint8List.fromList([1, 2, 3, 4])),
