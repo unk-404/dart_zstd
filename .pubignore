@@ -4,6 +4,5 @@
 .agents/
 .github/
 benchmark/
-assets/fonts/
 build/
 coverage/
