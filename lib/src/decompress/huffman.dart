@@ -104,7 +104,6 @@ final class HuffmanTable {
     var state1 = bits.readBits(accuracyLog);
     var state2 = bits.readBits(accuracyLog);
     final entries = table.entries;
-    final stateBase = table.stateBase;
     var count = 0;
     while (true) {
       if (count >= kHuffmanMaxSymbols - 1) {
@@ -115,7 +114,7 @@ final class HuffmanTable {
       }
       final entry1 = entries[state1];
       weights[count++] = entry1 & 0xFF;
-      state1 = stateBase[state1] + bits.readBits(entry1 >> 8);
+      state1 = (entry1 >>> 12) + bits.readBits((entry1 >>> 8) & 0xF);
       if (bits.bitPosition < 0) {
         if (count >= kHuffmanMaxSymbols - 1) {
           throw const ZstdException(
@@ -135,7 +134,7 @@ final class HuffmanTable {
       }
       final entry2 = entries[state2];
       weights[count++] = entry2 & 0xFF;
-      state2 = stateBase[state2] + bits.readBits(entry2 >> 8);
+      state2 = (entry2 >>> 12) + bits.readBits((entry2 >>> 8) & 0xF);
       if (bits.bitPosition < 0) {
         if (count >= kHuffmanMaxSymbols - 1) {
           throw const ZstdException(
@@ -326,15 +325,34 @@ final class HuffmanTable {
     }
     final mask = kPow2[table.maxBits] - 1;
     final entries = table.entries;
-    var state = bits.readBits(table.maxBits);
+    final window = BitWindow(bits);
+    final maxBits = table.maxBits;
+    int state;
+    {
+      final available = 32 - window.bitsConsumed;
+      if (available >= maxBits) {
+        state =
+            (window.container >>> (available - maxBits)) & kBitMasks[maxBits];
+        window.bitsConsumed += maxBits;
+      } else {
+        state = window.readBits(maxBits);
+      }
+    }
     for (var i = 0; i < length; i++) {
       final entry = entries[state];
       final nb = entry >> 8;
-      final rest = bits.readBits(nb);
+      final available = 32 - window.bitsConsumed;
+      int rest;
+      if (available >= nb) {
+        rest = (window.container >>> (available - nb)) & kBitMasks[nb];
+        window.bitsConsumed += nb;
+      } else {
+        rest = window.readBits(nb);
+      }
       dst[dstStart + i] = entry & 0xFF;
       state = ((state << nb) + rest) & mask;
     }
-    if (bits.bitPosition != -table.maxBits) {
+    if (window.bitPosition != -table.maxBits) {
       throw const ZstdException(
         ZstdErrorCode.invalidHuffmanTree,
         'Huffman stream was not consumed exactly',

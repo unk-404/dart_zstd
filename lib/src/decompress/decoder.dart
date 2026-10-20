@@ -287,7 +287,7 @@ final class ZstdDecoder extends Converter<List<int>, List<int>> {
             );
           }
           ensureCapacity(length + context.blockMax);
-          final writer = ContiguousBlockOutput(context, buffer, length);
+          final writer = BlockOutput.contiguous(context, buffer, length);
           decodeCompressedBlock(
             context,
             input,
@@ -713,7 +713,7 @@ final class _ZstdDecodingSink extends ByteConversionSink {
     } else {
       ring.ensure(history, context.blockMax);
       final blockStart = ring.position;
-      final writer = RingBlockOutput(context, ring);
+      final writer = BlockOutput.ring(context, ring);
       decodeCompressedBlock(
         context,
         _input,

@@ -35,6 +35,10 @@ final class Xxh64Digest {
 }
 
 /// Streaming XXH64 state.
+///
+/// The VM implementation reads 32-bit and 64-bit words through [ByteData],
+/// which compiles to single unaligned loads instead of four byte loads plus
+/// shifts per word.
 final class Xxh64 {
   Xxh64([int seed = 0])
     : _seed = seed,
@@ -50,6 +54,7 @@ final class Xxh64 {
   int _v4;
   int _total = 0;
   final Uint8List _memory = Uint8List(32);
+  late final ByteData _memoryData = ByteData.sublistView(_memory);
   int _memorySize = 0;
 
   /// Feeds `data[start..end)`.
@@ -70,13 +75,14 @@ final class Xxh64 {
       final fill = 32 - _memorySize;
       _memory.setRange(_memorySize, 32, data, i);
       i += fill;
-      _stripe(_memory, 0);
+      _stripe(_memoryData, 0);
       _memorySize = 0;
     }
 
+    final words = ByteData.sublistView(data);
     final limit = stop - 32;
     while (i <= limit) {
-      _stripe(data, i);
+      _stripe(words, i);
       i += 32;
     }
 
@@ -88,6 +94,7 @@ final class Xxh64 {
 
   /// Finishes the hash. The state must not be updated afterwards.
   Xxh64Digest digest() {
+    final memory = _memoryData;
     int h;
     if (_total >= 32) {
       h = _rotl(_v1, 1) + _rotl(_v2, 7) + _rotl(_v3, 12) + _rotl(_v4, 18);
@@ -102,12 +109,12 @@ final class Xxh64 {
 
     var i = 0;
     while (i + 8 <= _memorySize) {
-      h ^= _round(0, _read64(_memory, i));
+      h ^= _round(0, memory.getUint64(i, Endian.little));
       h = _rotl(h, 27) * _prime1 + _prime4;
       i += 8;
     }
     if (i + 4 <= _memorySize) {
-      h ^= _read32(_memory, i) * _prime1;
+      h ^= memory.getUint32(i, Endian.little) * _prime1;
       h = _rotl(h, 23) * _prime2 + _prime3;
       i += 4;
     }
@@ -126,11 +133,11 @@ final class Xxh64 {
     return Xxh64Digest((h >>> 32) & 0xFFFFFFFF, h & 0xFFFFFFFF);
   }
 
-  void _stripe(Uint8List data, int offset) {
-    _v1 = _round(_v1, _read64(data, offset));
-    _v2 = _round(_v2, _read64(data, offset + 8));
-    _v3 = _round(_v3, _read64(data, offset + 16));
-    _v4 = _round(_v4, _read64(data, offset + 24));
+  void _stripe(ByteData data, int offset) {
+    _v1 = _round(_v1, data.getUint64(offset, Endian.little));
+    _v2 = _round(_v2, data.getUint64(offset + 8, Endian.little));
+    _v3 = _round(_v3, data.getUint64(offset + 16, Endian.little));
+    _v4 = _round(_v4, data.getUint64(offset + 24, Endian.little));
   }
 
   static int _round(int acc, int input) {
@@ -149,13 +156,4 @@ final class Xxh64 {
 
   static int _rotl(int value, int bits) =>
       (value << bits) | (value >>> (64 - bits));
-
-  static int _read32(Uint8List data, int offset) =>
-      data[offset] |
-      (data[offset + 1] << 8) |
-      (data[offset + 2] << 16) |
-      (data[offset + 3] << 24);
-
-  static int _read64(Uint8List data, int offset) =>
-      _read32(data, offset) | (_read32(data, offset + 4) << 32);
 }

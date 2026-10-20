@@ -14,14 +14,22 @@ final class FseCTable {
   FseCTable._(
     this.tableLog,
     this.maxSymbolValue,
-    this._stateTable,
-    this._deltaNbBits,
-    this._deltaFindState,
+    this.stateTable,
+    this.deltaNbBits,
+    this.deltaFindState,
   );
 
   /// Creates the trivial "table" used by `RLE_Mode` (no bits are emitted).
-  factory FseCTable.rle(int symbol) =>
-      FseCTable._(0, symbol, Uint16List(0), Uint32List(0), Int32List(0));
+  ///
+  /// The arrays are zero-filled so the inlined sequence writer can index them
+  /// by symbol without a special case.
+  factory FseCTable.rle(int symbol) => FseCTable._(
+    0,
+    symbol,
+    Uint16List(symbol + 1),
+    Uint32List(symbol + 1),
+    Int32List(symbol + 1),
+  );
 
   /// Accuracy log of the table (`Table_Size == 1 << tableLog`).
   final int tableLog;
@@ -29,9 +37,9 @@ final class FseCTable {
   /// Highest symbol representable by this table.
   final int maxSymbolValue;
 
-  final Uint16List _stateTable;
-  final Uint32List _deltaNbBits;
-  final Int32List _deltaFindState;
+  final Uint16List stateTable;
+  final Uint32List deltaNbBits;
+  final Int32List deltaFindState;
 
   int get tableSize => 1 << tableLog;
 
@@ -146,31 +154,34 @@ final class FseCTable {
   ///
   /// Used for the symbol that will be decoded last: no state-transition bits
   /// have to be emitted for it, only the final state at flush time.
+  @pragma('vm:prefer-inline')
   int initStateForSymbol(int symbol) {
     if (tableLog == 0) return 0;
     if (symbol > maxSymbolValue) {
       throw ArgumentError.value(symbol, 'symbol', 'outside table');
     }
-    final deltaNbBits = _deltaNbBits[symbol];
-    final bitsOut = (deltaNbBits + (1 << 15)) >> 16;
-    var value = (bitsOut << 16) - deltaNbBits;
-    value = _stateTable[(value >> bitsOut) + _deltaFindState[symbol]];
+    final delta = deltaNbBits[symbol];
+    final bitsOut = (delta + (1 << 15)) >> 16;
+    var value = (bitsOut << 16) - delta;
+    value = stateTable[(value >> bitsOut) + deltaFindState[symbol]];
     return value;
   }
 
   /// Encodes [symbol] and returns the next state.
+  @pragma('vm:prefer-inline')
   int encodeSymbol(BitWriter bitWriter, int state, int symbol) {
     if (tableLog == 0) return 0;
     if (symbol > maxSymbolValue) {
       throw ArgumentError.value(symbol, 'symbol', 'outside table');
     }
-    final deltaNbBits = _deltaNbBits[symbol];
-    final bitsOut = (state + deltaNbBits) >> 16;
+    final delta = deltaNbBits[symbol];
+    final bitsOut = (state + delta) >> 16;
     bitWriter.addBits(state, bitsOut);
-    return _stateTable[(state >> bitsOut) + _deltaFindState[symbol]];
+    return stateTable[(state >> bitsOut) + deltaFindState[symbol]];
   }
 
   /// Writes the final state (`Accuracy_Log` bits).
+  @pragma('vm:prefer-inline')
   void flushState(BitWriter bitWriter, int state) {
     if (tableLog == 0) return;
     bitWriter.addBits(state, tableLog);
@@ -411,7 +422,6 @@ void encodeFseStreamTwoStates(
   }
   table.flushState(bitWriter, state2);
   table.flushState(bitWriter, state1);
-  bitWriter.finish();
 }
 
 int _highBit32(int value) {

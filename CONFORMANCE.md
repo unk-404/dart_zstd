@@ -8,18 +8,18 @@
 
 | Feature | Decode | Encode |
 | --- | :---: | :---: |
-| Zstandard frames, concatenated frames | 鉁?| 鉁?(one frame) |
-| Skippable frames | 鉁?| 鈥?|
-| Raw / RLE / compressed blocks | 鉁?| 鉁?|
-| Raw / RLE literals | 鉁?| 鉁?|
-| Huffman literals, 1 and 4 streams | 鉁?| 鉁?|
-| Treeless literals / repeat Huffman | 鉁?| 鉁?|
-| Predefined / RLE / custom FSE / repeat sequence tables | 鉁?| 鉁?|
-| Repeat offsets, including the literal-length-zero rule | 鉁?| 鉁?|
-| Content checksum (XXH64 low 32 bits) | 鉁?| optional |
-| Frame content size (1/2/4/8 bytes) | 鉁?| one-shot |
-| Formatted and raw-content dictionaries | 鉁?| 鉁?|
-| Streaming with arbitrary chunk boundaries | 鉁?| 鉁?|
+| Zstandard frames, concatenated frames | ✓ | ✓ (one frame) |
+| Skippable frames | ✓ | — |
+| Raw / RLE / compressed blocks | ✓ | ✓ |
+| Raw / RLE literals | ✓ | ✓ |
+| Huffman literals, 1 and 4 streams | ✓ | ✓ |
+| Treeless literals / repeat Huffman | ✓ | ✓ |
+| Predefined / RLE / custom FSE / repeat sequence tables | ✓ | ✓ |
+| Repeat offsets, including the literal-length-zero rule | ✓ | ✓ |
+| Content checksum (XXH64 low 32 bits) | ✓ | optional |
+| Frame content size (1/2/4/8 bytes) | ✓ | one-shot |
+| Formatted and raw-content dictionaries | ✓ | ✓ |
+| Streaming with arbitrary chunk boundaries | ✓ | ✓ |
 
 ## Verification
 
@@ -28,7 +28,7 @@
   `tests/decodecorpus`) is decoded byte-for-byte by
   `test/conformance_test.dart`.
 - Official zstd golden/error vectors (`test/fixtures/`).
-- Every encoder level 1鈥?9, checksum on/off, streaming and dictionary output is
+- Every encoder level 1–19, checksum on/off, streaming and dictionary output is
   decoded byte-exactly by libzstd 1.5.7 through the dev-only Rust harness
   (`test/interop_test.dart`, `test/differential_test.dart`).
 - Differential and corruption fuzzing (`tool/fuzz/`), including multi-MiB
@@ -46,7 +46,7 @@ their configured limits. `zstd_neo` does so, with explicit errors:
   `ZstdErrorCode.windowTooLarge`.
 - `maxOutputSize` (optional) bounds decompressed output across concatenated
   frames (`ZstdErrorCode.outputTooLarge`).
-- A `Frame_Content_Size` above **2^53鈭?** is rejected with `outputTooLarge`;
+- A `Frame_Content_Size` above **2^53−1** is rejected with `outputTooLarge`;
   such a frame cannot be materialized as a Dart `Uint8List` on the web anyway.
 - Blocks are limited to 128 KiB, as required by the format.
 - A stream containing only skippable frames yields empty output, matching the
@@ -54,12 +54,12 @@ their configured limits. `zstd_neo` does so, with explicit errors:
 
 ## Not part of the current scope
 
-- Legacy zstd formats (pre-v0.8 frames) 鈥?not part of RFC 8878.
+- Legacy zstd formats (pre-v0.8 frames) — not part of RFC 8878.
 - Seekable format (a separate specification, not a frame format feature).
 - Long-distance matching (`--long`) encoding, multithreaded encoding and
   dictionary training.
-- Encoder levels 20鈥?2 and negative 鈥渇ast鈥?levels; levels 1鈥?9 are available.
-- Encoder levels 10鈥?9 use deep lazy2 chains as an approximation of the
+- Encoder levels 20–22 and negative “fast” levels; levels 1–19 are available.
+- Encoder levels 10–19 use deep lazy2 chains as an approximation of the
   reference `btopt`/`btultra` parsers. Frames are valid and ratios are
   competitive, but they are not bit-identical to libzstd's parameter choices.
 

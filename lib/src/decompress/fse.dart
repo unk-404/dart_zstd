@@ -26,20 +26,19 @@ const int kMaxOffsetAccuracyLog = 8;
 
 /// A single FSE decoding table.
 ///
-/// Row `state` decodes to a symbol and a state-update bit count packed into
-/// `entries[state]` (low byte: symbol, high byte: number of bits), while
-/// `stateBase[state]` is added to the bits read from the stream to produce the
-/// next state.
+/// Row `state` packs everything the sequence loop needs into one 32-bit entry:
+/// symbol in bits 0-7, state-update bit count in bits 8-11 and the next-state
+/// base in bits 12-20. The base is always `< table size`, because the table is
+/// at most `2^9` rows for LL/ML and `2^8` for offsets.
 final class FseTable {
-  FseTable(this.entries, this.stateBase, this.accuracyLog);
+  FseTable(this.entries, this.accuracyLog);
 
-  final Uint16List entries;
-  final Uint16List stateBase;
+  final Uint32List entries;
   final int accuracyLog;
 
   /// The degenerate table used by `RLE_Mode`: one symbol, no bits consumed.
   static FseTable rle(int symbol) =>
-      FseTable(Uint16List.fromList(<int>[symbol]), Uint16List(1), 0);
+      FseTable(Uint32List.fromList(<int>[symbol]), 0);
 
   /// Builds a table from a normalized distribution.
   ///
@@ -79,8 +78,6 @@ final class FseTable {
     }
 
     final symbols = Uint8List(size);
-    final numBits = Uint8List(size);
-    final stateBase = Uint16List(size);
     final stateDesc = Int32List(numSymbols);
 
     // "less than 1" probabilities get the last rows, in natural order.
@@ -119,20 +116,16 @@ final class FseTable {
       );
     }
 
+    final entries = Uint32List(size);
     for (var i = 0; i < size; i++) {
       final symbol = symbols[i];
       final nextStateDesc = stateDesc[symbol]++;
       final bits = accuracyLog - highestSetBit(nextStateDesc);
-      numBits[i] = bits;
-      stateBase[i] = (nextStateDesc << bits) - size;
+      final base = (nextStateDesc << bits) - size;
+      entries[i] = symbol | (bits << 8) | (base << 12);
     }
 
-    final entries = Uint16List(size);
-    for (var i = 0; i < size; i++) {
-      entries[i] = symbols[i] | (numBits[i] << 8);
-    }
-
-    return FseTable(entries, stateBase, accuracyLog);
+    return FseTable(entries, accuracyLog);
   }
 
   /// Parses an FSE distribution table from [reader] and leaves it byte aligned

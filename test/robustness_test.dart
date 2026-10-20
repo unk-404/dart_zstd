@@ -1091,7 +1091,7 @@ void main() {
           _frameHeader(1 << 20),
           ParsedDictionary(dictionaryId: 0, content: dictionary),
         )..frameOut = prefill;
-        final output = ContiguousBlockOutput(context, buffer, prefill);
+        final output = BlockOutput.contiguous(context, buffer, prefill);
         final valid = _applyNaiveMatch(
           expected,
           prefill,

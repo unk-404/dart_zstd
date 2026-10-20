@@ -59,7 +59,10 @@ final class HuffmanTable {
 ///
 /// Returns `null` when fewer than two symbols are present (the caller should
 /// emit RLE literals instead) or when no valid table could be produced.
-HuffmanTable? buildHuffmanTable(Uint32List counts) {
+///
+/// [scratch] carries the package-merge node arrays between calls so that
+/// repeated blocks do not allocate thousands of temporary objects.
+HuffmanTable? buildHuffmanTable(Uint32List counts, {HuffmanScratch? scratch}) {
   final symbols = <int>[];
   for (var s = 0; s < 256; s++) {
     if (counts[s] != 0) symbols.add(s);
@@ -67,8 +70,18 @@ HuffmanTable? buildHuffmanTable(Uint32List counts) {
   if (symbols.length < 2) return null;
   if (symbols.length > (1 << huffmanMaxBits)) return null;
 
-  final freqs = [for (final s in symbols) counts[s]];
-  final lengths = _packageMergeLengths(symbols, freqs, huffmanMaxBits);
+  final symbolArray = Int32List.fromList(symbols);
+  final freqs = Int32List(symbols.length);
+  for (var i = 0; i < symbols.length; i++) {
+    freqs[i] = counts[symbols[i]];
+  }
+  final scratchUsed = scratch ?? HuffmanScratch();
+  final lengths = _packageMergeLengths(
+    symbolArray,
+    freqs,
+    huffmanMaxBits,
+    scratchUsed,
+  );
   if (lengths == null) return null;
 
   var maxLen = 0;
@@ -158,16 +171,22 @@ Uint8List? writeHuffmanTreeDescription(HuffmanTable table) {
 ///
 /// [fourStreams] selects the 4-stream layout (mandatory above 1 KiB of
 /// literals); the 6-byte jump table is filled in afterwards.
+///
+/// [scratch] is reused across calls (and across blocks) to avoid allocating a
+/// bit accumulator for every literals section.
 Uint8List encodeHuffmanLiterals(
   Uint8List src,
   int start,
   int end,
   HuffmanTable table, {
   required bool fourStreams,
+  BitWriter? scratch,
 }) {
   final output = ByteWriter((end - start) + 32);
+  final writer = scratch ?? BitWriter((end - start) + 16);
+  writer.reset();
   if (!fourStreams) {
-    _encodeSingleStream(output, src, start, end, table);
+    _encodeSingleStream(output, src, start, end, table, writer);
     return output.takeBytes();
   }
   output.writeUint16(0);
@@ -178,9 +197,14 @@ Uint8List encodeHuffmanLiterals(
   var offset = start;
   for (var i = 0; i < 4; i++) {
     final segmentEnd = i == 3 ? end : offset + segmentSize;
-    final before = output.length;
-    _encodeSingleStream(output, src, offset, segmentEnd, table);
-    final written = output.length - before;
+    final written = _encodeSingleStream(
+      output,
+      src,
+      offset,
+      segmentEnd,
+      table,
+      writer,
+    );
     if (i < 3) sizes[i] = written;
     offset = segmentEnd;
   }
@@ -193,23 +217,27 @@ Uint8List encodeHuffmanLiterals(
   return output.takeBytes();
 }
 
-void _encodeSingleStream(
+int _encodeSingleStream(
   ByteWriter output,
   Uint8List src,
   int start,
   int end,
   HuffmanTable table,
+  BitWriter writer,
 ) {
-  final bitWriter = BitWriter(output);
   for (var i = end - 1; i >= start; i--) {
     final symbol = src[i];
     final nbBits = table.bits[symbol];
     if (nbBits == 0) {
       throw StateError('Huffman table cannot encode symbol $symbol');
     }
-    bitWriter.addBits(table.codes[symbol], nbBits);
+    writer.addBits(table.codes[symbol], nbBits);
   }
-  bitWriter.finish();
+  writer.finish();
+  final written = writer.length;
+  output.writeBytes(writer.bytes);
+  writer.reset();
+  return written;
 }
 
 Uint8List? _compressWeights(Uint8List weights, int count) {
@@ -236,8 +264,10 @@ Uint8List? _compressWeights(Uint8List weights, int count) {
     final output = ByteWriter(64);
     writeFseNCount(output, normalized, maxWeight, tableLog);
     final table = FseCTable.fromNormalized(normalized, maxWeight, tableLog);
-    final bitWriter = BitWriter(output);
+    final bitWriter = BitWriter(count + 16);
     encodeFseStreamTwoStates(bitWriter, table, weights);
+    bitWriter.finish();
+    output.writeBytes(bitWriter.bytes);
     return output.takeBytes();
   } on ArgumentError {
     return null;
@@ -248,63 +278,128 @@ Uint8List? _compressWeights(Uint8List weights, int count) {
 
 // --- Package-merge length-limited Huffman code construction -----------------
 
-final class _PmItem {
-  _PmItem(this.weight, this.members);
+/// Reusable node storage for the package-merge algorithm.
+final class HuffmanScratch {
+  Int32List weights = Int32List(0);
+  Int32List left = Int32List(0);
+  Int32List right = Int32List(0);
+  Int32List symbol = Int32List(0);
+  Int32List stack = Int32List(0);
+  final Int32List lengths = Int32List(256);
+  final Int32List levelStart = Int32List(16);
+  final Int32List levelCount = Int32List(16);
 
-  final int weight;
-  final List<int> members;
+  void _ensure(int nodes) {
+    if (nodes <= weights.length) return;
+    final capacity = nodes * 2;
+    weights = Int32List(capacity);
+    left = Int32List(capacity);
+    right = Int32List(capacity);
+    symbol = Int32List(capacity);
+    stack = Int32List(capacity);
+  }
 }
 
-List<int>? _packageMergeLengths(
-  List<int> symbols,
-  List<int> frequencies,
+Int32List? _packageMergeLengths(
+  Int32List symbols,
+  Int32List frequencies,
   int maxBits,
+  HuffmanScratch scratch,
 ) {
   final n = symbols.length;
-  final coins = <_PmItem>[];
-  for (var i = 0; i < n; i++) {
-    coins.add(_PmItem(frequencies[i], <int>[symbols[i]]));
-  }
-  coins.sort((a, b) {
-    final byWeight = a.weight.compareTo(b.weight);
-    if (byWeight != 0) return byWeight;
-    return a.members.first.compareTo(b.members.first);
-  });
   if (n == 1) return null;
-
-  var pool = List<_PmItem>.of(coins);
   final needed = 2 * n - 2;
+  scratch._ensure((n * 3 + 4) * (maxBits + 2));
+  final weights = scratch.weights;
+  final left = scratch.left;
+  final right = scratch.right;
+  final nodeSymbol = scratch.symbol;
+  final levelStart = scratch.levelStart;
+  final levelCount = scratch.levelCount;
+  final lengths = scratch.lengths;
+  lengths.fillRange(0, 256, 0);
+
+  // Level 0: one leaf node per symbol, sorted by (frequency, symbol).
+  final order = List<int>.generate(n, (i) => i);
+  order.sort((a, b) {
+    final byWeight = frequencies[a].compareTo(frequencies[b]);
+    if (byWeight != 0) return byWeight;
+    return symbols[a].compareTo(symbols[b]);
+  });
+  for (var i = 0; i < n; i++) {
+    final source = order[i];
+    weights[i] = frequencies[source];
+    left[i] = -1;
+    right[i] = -1;
+    nodeSymbol[i] = symbols[source];
+  }
+  levelStart[0] = 0;
+  levelCount[0] = n;
+  var total = n;
+
   for (var level = 1; level < maxBits; level++) {
-    final packages = <_PmItem>[];
-    for (var i = 0; i + 1 < pool.length; i += 2) {
-      final a = pool[i];
-      final b = pool[i + 1];
-      packages.add(
-        _PmItem(a.weight + b.weight, <int>[...a.members, ...b.members]),
-      );
+    final previousStart = levelStart[level - 1];
+    final previousCount = levelCount[level - 1];
+    final packageCount = previousCount >> 1;
+    final packageStart = total;
+    total += packageCount;
+    for (var i = 0; i < packageCount; i++) {
+      final a = previousStart + 2 * i;
+      final b = a + 1;
+      final node = packageStart + i;
+      weights[node] = weights[a] + weights[b];
+      left[node] = a;
+      right[node] = b;
+      nodeSymbol[node] = -1;
     }
-    final merged = <_PmItem>[];
+    final mergedStart = total;
+    final mergedCount = n + packageCount;
+    total += mergedCount;
     var coinIndex = 0;
     var packageIndex = 0;
-    while (coinIndex < coins.length || packageIndex < packages.length) {
+    var out = mergedStart;
+    while (coinIndex < n || packageIndex < packageCount) {
       final takeCoin =
-          packageIndex >= packages.length ||
-          (coinIndex < coins.length &&
-              coins[coinIndex].weight <= packages[packageIndex].weight);
+          packageIndex >= packageCount ||
+          (coinIndex < n &&
+              weights[coinIndex] <= weights[packageStart + packageIndex]);
       if (takeCoin) {
-        merged.add(coins[coinIndex++]);
+        weights[out] = weights[coinIndex];
+        left[out] = -1;
+        right[out] = -1;
+        nodeSymbol[out] = nodeSymbol[coinIndex];
+        coinIndex++;
       } else {
-        merged.add(packages[packageIndex++]);
+        final node = packageStart + packageIndex;
+        weights[out] = weights[node];
+        left[out] = left[node];
+        right[out] = right[node];
+        nodeSymbol[out] = -1;
+        packageIndex++;
       }
+      out++;
     }
-    pool = merged;
+    levelStart[level] = mergedStart;
+    levelCount[level] = mergedCount;
   }
-  if (pool.length < needed) return null;
 
-  final lengths = List<int>.filled(256, 0);
+  final topStart = levelStart[maxBits - 1];
+  final topCount = levelCount[maxBits - 1];
+  if (topCount < needed) return null;
+
+  final stack = scratch.stack;
+  var stackSize = 0;
   for (var i = 0; i < needed; i++) {
-    for (final symbol in pool[i].members) {
-      lengths[symbol]++;
+    stack[stackSize++] = topStart + i;
+  }
+  while (stackSize > 0) {
+    final node = stack[--stackSize];
+    final decodedSymbol = nodeSymbol[node];
+    if (decodedSymbol >= 0) {
+      lengths[decodedSymbol]++;
+    } else {
+      stack[stackSize++] = left[node];
+      stack[stackSize++] = right[node];
     }
   }
   return lengths;

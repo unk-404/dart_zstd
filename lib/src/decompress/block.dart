@@ -32,6 +32,101 @@ const List<int> kMatchLengthBase = <int>[
   99, 131, 259, 515, 1027, 2051, 4099, 8195, 16387, 32771, 65539,
 ];
 
+const List<int> _kMlPacked = <int>[
+  3,
+  4,
+  5,
+  6,
+  7,
+  8,
+  9,
+  10,
+  11,
+  12,
+  13,
+  14,
+  15,
+  16,
+  17,
+  18,
+  19,
+  20,
+  21,
+  22,
+  23,
+  24,
+  25,
+  26,
+  27,
+  28,
+  29,
+  30,
+  31,
+  32,
+  33,
+  34,
+  131107,
+  131109,
+  131111,
+  131113,
+  262187,
+  262191,
+  393267,
+  393275,
+  524355,
+  524371,
+  655459,
+  917635,
+  1048835,
+  1180163,
+  1311747,
+  1443843,
+  1576963,
+  1712131,
+  1851395,
+  1998851,
+  2162691,
+];
+
+const List<int> _kLlPacked = <int>[
+  0,
+  1,
+  2,
+  3,
+  4,
+  5,
+  6,
+  7,
+  8,
+  9,
+  10,
+  11,
+  12,
+  13,
+  14,
+  15,
+  131088,
+  131090,
+  131092,
+  131094,
+  262168,
+  262172,
+  393248,
+  393256,
+  524336,
+  786496,
+  917632,
+  1048832,
+  1180160,
+  1311744,
+  1443840,
+  1576960,
+  1712128,
+  1851392,
+  1998848,
+  2162688,
+];
+
 /// Number of additional bits for each match length code.
 const List<int> kMatchLengthExtra = <int>[
   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, //
@@ -49,40 +144,86 @@ final class BlockLiterals {
   final int length;
 }
 
-/// Destination for the literals and matches of one compressed block.
-abstract interface class BlockOutput {
-  /// Bytes produced by the block decoded so far.
-  int get blockOut;
-
-  void writeLiterals(Uint8List src, int srcStart, int length);
-
-  void copyMatch(int offset, int length);
+/// Reads [n] bits from [window]'s fast path, falling back to the full reader
+/// only when the window is exhausted. Kept tiny so AOT/dart2js inline it.
+@pragma('vm:prefer-inline')
+int _readBits(BitWindow window, int n) {
+  final available = 32 - window.bitsConsumed;
+  if (available >= n) {
+    final value = (window.container >>> (available - n)) & kBitMasks[n];
+    window.bitsConsumed += n;
+    return value;
+  }
+  return window.readBits(n);
 }
 
-/// Block output writing into one contiguous (one-shot) frame buffer.
-final class ContiguousBlockOutput implements BlockOutput {
-  ContiguousBlockOutput(this.context, this.buffer, this.position);
+/// Destination for the literals and matches of one compressed block.
+///
+/// One concrete class is used for both one-shot (contiguous frame buffer) and
+/// streaming (ring buffer) decoding. Keeping a single receiver type lets the
+/// optimizing compiler devirtualize and inline the two hot methods.
+final class BlockOutput {
+  BlockOutput.contiguous(this.context, this.buffer, int startPosition)
+    : ring = null,
+      position = startPosition,
+      frameOut = context.frameOut,
+      windowSize = context.windowSize,
+      dictionary = context.dictionaryContent;
+
+  BlockOutput.ring(this.context, this.ring)
+    : buffer = _emptyBuffer,
+      position = 0,
+      frameOut = context.frameOut,
+      windowSize = context.windowSize,
+      dictionary = context.dictionaryContent;
 
   final FrameContext context;
   final Uint8List buffer;
+  final RingWindow? ring;
   int position;
-  int _blockOut = 0;
 
-  @override
-  int get blockOut => _blockOut;
+  /// Frame bytes decoded before this block (constant while the block decodes).
+  final int frameOut;
+  final int windowSize;
+  final Uint8List dictionary;
 
-  @override
+  /// Bytes produced by this block. Kept writable so the sequence hot loop can
+  /// update it directly and avoid a method call per sequence.
+  int blockOut = 0;
+
+  static final Uint8List _emptyBuffer = Uint8List(0);
+
   void writeLiterals(Uint8List src, int srcStart, int length) {
-    buffer.setRange(position, position + length, src, srcStart);
-    position += length;
-    _blockOut += length;
+    final r = ring;
+    if (r == null) {
+      final b = buffer;
+      final at = position;
+      if (length <= 3) {
+        for (var i = 0; i < length; i++) {
+          b[at + i] = src[srcStart + i];
+        }
+      } else {
+        b.setRange(at, at + length, src, srcStart);
+      }
+      position = at + length;
+    } else {
+      r.writeRaw(src, srcStart, length);
+    }
+    blockOut += length;
   }
 
-  @override
   void copyMatch(int offset, int length) {
-    final available = context.frameOut + _blockOut;
-    final dictionary = context.dictionaryContent;
-    if (available <= context.windowSize) {
+    final r = ring;
+    if (r == null) {
+      _copyContiguous(offset, length);
+    } else {
+      _copyRing(r, offset, length);
+    }
+  }
+
+  void _copyContiguous(int offset, int length) {
+    final available = frameOut + blockOut;
+    if (available <= windowSize) {
       if (offset > available + dictionary.length) {
         throw const ZstdException(
           ZstdErrorCode.invalidSequence,
@@ -101,77 +242,59 @@ final class ContiguousBlockOutput implements BlockOutput {
           dictionaryOffset,
         );
         position += dictionaryCopy;
-        _blockOut += dictionaryCopy;
+        blockOut += dictionaryCopy;
         length -= dictionaryCopy;
       }
-    } else if (offset > context.windowSize) {
+    } else if (offset > windowSize) {
       throw const ZstdException(
         ZstdErrorCode.invalidSequence,
         'match offset exceeds the frame window',
       );
     }
-
-    if (length > 0) {
-      final source = position - offset;
-      if (source < 0) {
-        throw const ZstdException(
-          ZstdErrorCode.invalidSequence,
-          'match offset reaches before the frame start',
-        );
-      }
-      if (offset >= length) {
-        buffer.setRange(position, position + length, buffer, source);
-      } else if (length >= 192) {
-        // Overlapping copy. First copy the pattern (at most `offset` bytes),
-        // then repeatedly double it. Every setRange source range ends at or
-        // before its destination range starts, so no copy overlaps itself.
-        var copied = offset < length ? offset : length;
-        buffer.setRange(position, position + copied, buffer, source);
-        while (copied < length) {
-          var next = copied;
-          final remaining = length - copied;
-          if (next > remaining) next = remaining;
-          buffer.setRange(
-            position + copied,
-            position + copied + next,
-            buffer,
-            position,
-          );
-          copied += next;
+    if (length <= 0) return;
+    final b = buffer;
+    final start = position;
+    final source = start - offset;
+    if (source < 0) {
+      throw const ZstdException(
+        ZstdErrorCode.invalidSequence,
+        'match offset reaches before the frame start',
+      );
+    }
+    if (offset == 1) {
+      b.fillRange(start, start + length, b[source]);
+    } else if (offset >= length) {
+      if (length <= 7) {
+        for (var i = 0; i < length; i++) {
+          b[start + i] = b[source + i];
         }
       } else {
-        for (var i = 0; i < length; i++) {
-          buffer[position + i] = buffer[source + i];
-        }
+        b.setRange(start, start + length, b, source);
       }
-      position += length;
-      _blockOut += length;
+    } else if (length >= 192) {
+      // Overlapping copy: copy the pattern, then double it. Every source range
+      // ends where the destination range starts, so no copy overlaps itself.
+      var copied = offset < length ? offset : length;
+      b.setRange(start, start + copied, b, source);
+      while (copied < length) {
+        var next = copied;
+        final remaining = length - copied;
+        if (next > remaining) next = remaining;
+        b.setRange(start + copied, start + copied + next, b, start);
+        copied += next;
+      }
+    } else {
+      for (var i = 0; i < length; i++) {
+        b[start + i] = b[source + i];
+      }
     }
-  }
-}
-
-/// Block output writing into the streaming ring buffer.
-final class RingBlockOutput implements BlockOutput {
-  RingBlockOutput(this.context, this.ring);
-
-  final FrameContext context;
-  final RingWindow ring;
-  int _blockOut = 0;
-
-  @override
-  int get blockOut => _blockOut;
-
-  @override
-  void writeLiterals(Uint8List src, int srcStart, int length) {
-    ring.writeRaw(src, srcStart, length);
-    _blockOut += length;
+    position = start + length;
+    blockOut += length;
   }
 
-  @override
-  void copyMatch(int offset, int length) {
-    final available = context.frameOut + _blockOut;
-    final dictionary = context.dictionaryContent;
-    if (available <= context.windowSize) {
+  void _copyRing(RingWindow ring, int offset, int length) {
+    final available = frameOut + blockOut;
+    if (available <= windowSize) {
       if (offset > available + dictionary.length) {
         throw const ZstdException(
           ZstdErrorCode.invalidSequence,
@@ -184,20 +307,22 @@ final class RingBlockOutput implements BlockOutput {
             : length;
         final dictionaryOffset = dictionary.length - (offset - available);
         ring.writeRaw(dictionary, dictionaryOffset, dictionaryCopy);
-        _blockOut += dictionaryCopy;
+        blockOut += dictionaryCopy;
         length -= dictionaryCopy;
       }
-    } else if (offset > context.windowSize) {
+    } else if (offset > windowSize) {
       throw const ZstdException(
         ZstdErrorCode.invalidSequence,
         'match offset exceeds the frame window',
       );
     }
-
-    if (length > 0) {
+    if (length <= 0) return;
+    if (offset == 1) {
+      ring.fill(ring.buffer[(ring.position - 1) & ring.mask], length);
+    } else {
       ring.copyMatch(offset, length);
-      _blockOut += length;
     }
+    blockOut += length;
   }
 }
 
@@ -576,22 +701,26 @@ void _decodeSequences(
     );
   }
   final bits = BackwardBitReader(data, streamsStart, end);
+  final window = BitWindow(bits);
 
-  var llState = bits.readBits(llTable.accuracyLog);
-  var ofState = bits.readBits(ofTable.accuracyLog);
-  var mlState = bits.readBits(mlTable.accuracyLog);
+  var llState = window.readBits(llTable.accuracyLog);
+  var ofState = window.readBits(ofTable.accuracyLog);
+  var mlState = window.readBits(mlTable.accuracyLog);
 
   var literalPosition = 0;
   final literalsBytes = literals.bytes;
   final literalsStart = literals.start;
   final literalsLength = literals.length;
-  final repetitions = context.repOffsets;
+  final blockMax = context.blockMax;
+  final outBuffer = output.ring == null ? output.buffer : null;
+  final frameOut = output.frameOut;
+  final windowSize = output.windowSize;
+  var rep0 = context.repOffsets[0];
+  var rep1 = context.repOffsets[1];
+  var rep2 = context.repOffsets[2];
   final llEntries = llTable.entries;
-  final llBase = llTable.stateBase;
   final ofEntries = ofTable.entries;
-  final ofBase = ofTable.stateBase;
   final mlEntries = mlTable.entries;
-  final mlBase = mlTable.stateBase;
 
   for (var i = 0; i < numberOfSequences; i++) {
     final ofEntry = ofEntries[ofState];
@@ -608,20 +737,61 @@ void _decodeSequences(
     }
 
     final ofExtraBits = ofCode;
-    final offsetValue =
-        kPow2[ofCode] + (ofExtraBits > 0 ? bits.readBits(ofExtraBits) : 0);
+    final mlPacked = _kMlPacked[mlCode];
+    final mlExtraBits = mlPacked >>> 17;
+    final llPacked = _kLlPacked[llCode];
+    final llExtraBits = llPacked >>> 17;
+    final extraBits = ofExtraBits + mlExtraBits + llExtraBits;
+    final int offsetValue;
+    final int matchLength;
+    final int literalLength;
+    if (extraBits <= 24) {
+      // Fast path: the three extra fields are contiguous, so a single window
+      // read plus shifts replaces three reader calls.
+      final extraValue = extraBits > 0 ? _readBits(window, extraBits) : 0;
+      final llPart = extraValue & kBitMasks[llExtraBits];
+      final mlPart = (extraValue >>> llExtraBits) & kBitMasks[mlExtraBits];
+      final ofPart = extraValue >>> (llExtraBits + mlExtraBits);
+      offsetValue = kPow2[ofCode] + ofPart;
+      matchLength = (mlPacked & 0x1FFFF) + mlPart;
+      literalLength = (llPacked & 0x1FFFF) + llPart;
+    } else {
+      offsetValue =
+          kPow2[ofCode] +
+          (ofExtraBits > 0 ? _readBits(window, ofExtraBits) : 0);
+      matchLength =
+          (mlPacked & 0x1FFFF) +
+          (mlExtraBits > 0 ? _readBits(window, mlExtraBits) : 0);
+      literalLength =
+          (llPacked & 0x1FFFF) +
+          (llExtraBits > 0 ? _readBits(window, llExtraBits) : 0);
+    }
 
-    final mlExtraBits = kMatchLengthExtra[mlCode];
-    final matchLength =
-        kMatchLengthBase[mlCode] +
-        (mlExtraBits > 0 ? bits.readBits(mlExtraBits) : 0);
-
-    final llExtraBits = kLiteralsLengthExtra[llCode];
-    final literalLength =
-        kLiteralsLengthBase[llCode] +
-        (llExtraBits > 0 ? bits.readBits(llExtraBits) : 0);
-
-    final offset = _resolveOffset(offsetValue, literalLength, repetitions);
+    // Repeated-offset resolution, inlined with local registers.
+    int offset;
+    if (offsetValue > 3) {
+      offset = offsetValue - 3;
+      rep2 = rep1;
+      rep1 = rep0;
+      rep0 = offset;
+    } else {
+      var index = offsetValue - 1;
+      if (literalLength == 0) index++;
+      if (index == 0) {
+        offset = rep0;
+      } else {
+        offset = index == 3 ? rep0 - 1 : (index == 1 ? rep1 : rep2);
+        if (index > 1) rep2 = rep1;
+        rep1 = rep0;
+        rep0 = offset;
+      }
+    }
+    if (offset <= 0) {
+      throw const ZstdException(
+        ZstdErrorCode.invalidSequence,
+        'repeat offset resolved to a non-positive distance',
+      );
+    }
 
     if (literalLength > literalsLength - literalPosition) {
       throw const ZstdException(
@@ -629,7 +799,7 @@ void _decodeSequences(
         'sequence consumes more literals than available',
       );
     }
-    if (literalLength + matchLength > context.blockMax - output.blockOut) {
+    if (literalLength + matchLength > blockMax - output.blockOut) {
       throw const ZstdException(
         ZstdErrorCode.invalidSequence,
         'block output exceeds the block maximum size',
@@ -637,21 +807,90 @@ void _decodeSequences(
     }
 
     if (literalLength > 0) {
-      output.writeLiterals(
-        literalsBytes,
-        literalsStart + literalPosition,
-        literalLength,
-      );
+      if (outBuffer != null) {
+        final at = output.position;
+        if (literalLength <= 3) {
+          final source = literalsStart + literalPosition;
+          for (var k = 0; k < literalLength; k++) {
+            outBuffer[at + k] = literalsBytes[source + k];
+          }
+        } else {
+          outBuffer.setRange(
+            at,
+            at + literalLength,
+            literalsBytes,
+            literalsStart + literalPosition,
+          );
+        }
+        output.position = at + literalLength;
+        output.blockOut += literalLength;
+      } else {
+        output.writeLiterals(
+          literalsBytes,
+          literalsStart + literalPosition,
+          literalLength,
+        );
+      }
       literalPosition += literalLength;
     }
-    output.copyMatch(offset, matchLength);
+    final available = frameOut + output.blockOut;
+    if (outBuffer != null &&
+        offset <= available &&
+        (available <= windowSize || offset <= windowSize) &&
+        offset != 1) {
+      final at = output.position;
+      final source = at - offset;
+      if (offset >= matchLength) {
+        if (matchLength <= 7) {
+          for (var k = 0; k < matchLength; k++) {
+            outBuffer[at + k] = outBuffer[source + k];
+          }
+        } else {
+          outBuffer.setRange(at, at + matchLength, outBuffer, source);
+        }
+      } else if (matchLength >= 192) {
+        var copied = offset < matchLength ? offset : matchLength;
+        outBuffer.setRange(at, at + copied, outBuffer, source);
+        while (copied < matchLength) {
+          var next = copied;
+          final remaining = matchLength - copied;
+          if (next > remaining) next = remaining;
+          outBuffer.setRange(at + copied, at + copied + next, outBuffer, at);
+          copied += next;
+        }
+      } else {
+        for (var k = 0; k < matchLength; k++) {
+          outBuffer[at + k] = outBuffer[source + k];
+        }
+      }
+      output.position = at + matchLength;
+      output.blockOut += matchLength;
+    } else {
+      output.copyMatch(offset, matchLength);
+    }
 
     if (i != numberOfSequences - 1) {
-      llState = llBase[llState] + bits.readBits(llEntry >> 8);
-      mlState = mlBase[mlState] + bits.readBits(mlEntry >> 8);
-      ofState = ofBase[ofState] + bits.readBits(ofEntry >> 8);
+      final llNb = (llEntry >>> 8) & 0xF;
+      final mlNb = (mlEntry >>> 8) & 0xF;
+      final ofNb = (ofEntry >>> 8) & 0xF;
+      final nbTotal = llNb + mlNb + ofNb;
+      if (nbTotal <= 24) {
+        final nbValue = nbTotal > 0 ? _readBits(window, nbTotal) : 0;
+        llState = (llEntry >>> 12) + (nbValue >>> (ofNb + mlNb));
+        mlState = (mlEntry >>> 12) + ((nbValue >>> ofNb) & kBitMasks[mlNb]);
+        ofState = (ofEntry >>> 12) + (nbValue & kBitMasks[ofNb]);
+      } else {
+        llState = (llEntry >>> 12) + _readBits(window, llNb);
+        mlState = (mlEntry >>> 12) + _readBits(window, mlNb);
+        ofState = (ofEntry >>> 12) + _readBits(window, ofNb);
+      }
     }
   }
+
+  window.flush();
+  context.repOffsets[0] = rep0;
+  context.repOffsets[1] = rep1;
+  context.repOffsets[2] = rep2;
 
   if (bits.bitPosition != 0) {
     throw const ZstdException(
@@ -662,7 +901,7 @@ void _decodeSequences(
 
   final remaining = literalsLength - literalPosition;
   if (remaining > 0) {
-    if (remaining > context.blockMax - output.blockOut) {
+    if (remaining > blockMax - output.blockOut) {
       throw const ZstdException(
         ZstdErrorCode.invalidSequence,
         'block output exceeds the block maximum size',
@@ -674,34 +913,6 @@ void _decodeSequences(
       remaining,
     );
   }
-}
-
-int _resolveOffset(int offsetValue, int literalLength, List<int> repetitions) {
-  int offset;
-  if (offsetValue > 3) {
-    offset = offsetValue - 3;
-    repetitions[2] = repetitions[1];
-    repetitions[1] = repetitions[0];
-    repetitions[0] = offset;
-  } else {
-    var index = offsetValue - 1;
-    if (literalLength == 0) index++;
-    if (index == 0) {
-      offset = repetitions[0];
-    } else {
-      offset = index == 3 ? repetitions[0] - 1 : repetitions[index];
-      if (index > 1) repetitions[2] = repetitions[1];
-      repetitions[1] = repetitions[0];
-      repetitions[0] = offset;
-    }
-  }
-  if (offset <= 0) {
-    throw const ZstdException(
-      ZstdErrorCode.invalidSequence,
-      'repeat offset resolved to a non-positive distance',
-    );
-  }
-  return offset;
 }
 
 enum _SeqPart { literalLength, offset, matchLength }

@@ -1,4 +1,4 @@
-import 'byte_writer.dart';
+import 'dart:typed_data';
 
 /// Writes a zstd bitstream.
 ///
@@ -8,43 +8,66 @@ import 'byte_writer.dart';
 /// single `1` bit is appended as an end marker, then the final byte is padded
 /// with zeroes.
 ///
-/// The implementation keeps only a few bits in the register and flushes whole
-/// bytes eagerly. This produces exactly the same bytes as the reference
-/// implementation's wider accumulator, while staying within 32-bit integer
-/// semantics so it behaves identically on the VM, dart2js and dartwasm.
+/// Bytes accumulate in an internal flat `Uint8List` so the encoder's hottest
+/// paths avoid a method call per output byte. [finish] returns the number of
+/// bytes produced and [bytes] exposes them as a view; call [reset] before
+/// reusing the writer.
 final class BitWriter {
-  BitWriter(this._output);
+  BitWriter([int initialCapacity = 1024])
+    : _buffer = Uint8List(initialCapacity < 16 ? 16 : initialCapacity);
 
-  final ByteWriter _output;
-
+  Uint8List _buffer;
+  int _length = 0;
   int _container = 0;
   int _bitCount = 0;
 
-  /// Number of bits currently buffered (always `< 8` between calls).
+  /// Number of complete bytes produced so far.
+  int get length => _length;
+
+  /// Number of bits buffered in the register (`< 8` between calls).
   int get bitCount => _bitCount;
 
+  /// The bytes produced by [finish]; valid until [reset] or the next write.
+  Uint8List get bytes => Uint8List.sublistView(_buffer, 0, _length);
+
+  void _grow() {
+    final grown = Uint8List(_buffer.length * 2);
+    grown.setRange(0, _length, _buffer);
+    _buffer = grown;
+  }
+
   /// Appends the low [bitCount] bits of [value], least-significant bit first.
-  ///
-  /// [bitCount] must be at most 25, which covers every field the sequence
-  /// encoder writes (offset codes are capped by the frame window).
+  @pragma('vm:prefer-inline')
   void addBits(int value, int bitCount) {
     if (bitCount == 0) return;
-    final mask = (1 << bitCount) - 1;
-    _container |= (value & mask) << _bitCount;
+    _container |= (value & ((1 << bitCount) - 1)) << _bitCount;
     _bitCount += bitCount;
     while (_bitCount >= 8) {
-      _output.writeByte(_container & 0xFF);
+      if (_length == _buffer.length) _grow();
+      _buffer[_length++] = _container & 0xFF;
       _container >>>= 8;
       _bitCount -= 8;
     }
   }
 
   /// Appends the mandatory end marker and flushes the trailing partial byte.
-  void finish() {
+  ///
+  /// Returns the number of bytes produced. The writer is not reset; call
+  /// [reset] when reusing it.
+  int finish() {
     addBits(1, 1);
     if (_bitCount > 0) {
-      _output.writeByte(_container & 0xFF);
+      if (_length == _buffer.length) _grow();
+      _buffer[_length++] = _container & 0xFF;
+      _container = 0;
+      _bitCount = 0;
     }
+    return _length;
+  }
+
+  /// Clears the produced bytes while keeping the allocated capacity.
+  void reset() {
+    _length = 0;
     _container = 0;
     _bitCount = 0;
   }

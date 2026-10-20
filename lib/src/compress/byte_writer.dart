@@ -22,6 +22,7 @@ final class ByteWriter {
     _length = 0;
   }
 
+  @pragma('vm:prefer-inline')
   void _ensure(int extra) {
     final required = _length + extra;
     if (required <= _buffer.length) return;
@@ -35,12 +36,14 @@ final class ByteWriter {
   }
 
   /// Appends the low 8 bits of [value].
+  @pragma('vm:prefer-inline')
   void writeByte(int value) {
     _ensure(1);
     _buffer[_length++] = value & 0xFF;
   }
 
   /// Appends `source[start..end)`.
+  @pragma('vm:prefer-inline')
   void writeBytes(Uint8List source, [int start = 0, int? end]) {
     final stop = end ?? source.length;
     if (stop <= start) return;

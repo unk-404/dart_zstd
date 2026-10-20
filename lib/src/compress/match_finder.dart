@@ -1,6 +1,9 @@
 import 'dart:typed_data';
 
 import '../common/constants.dart';
+import 'hash_native.dart'
+    if (dart.library.js_interop) 'hash_web.dart'
+    as hashes;
 import 'sequences.dart';
 
 /// Match-finding strategy used by a compression level.
@@ -194,11 +197,19 @@ CompressionParameters _parametersFromRow(
   final chainLog = row.$2 > 21 ? 21 : row.$2;
   // Levels 10..19 approximate libzstd's bt* optimal parsers with a
   // progressively deeper lazy2 chain search (and therefore beat level 9).
+  // The depth is capped: beyond 256 attempts per position the ratio gain is
+  // far below 0.1% while chain-heavy inputs pay for every attempt.
   var searchLog = row.$4;
   if (level >= 10 && strategy == CompressionStrategy.lazy2) {
     var boosted = 5 + (level - 9);
-    if (boosted > 10) boosted = 10;
+    if (boosted > 8) boosted = 8;
     if (boosted > searchLog) searchLog = boosted;
+  }
+  // Level 9 uses 16 chain attempts instead of 32. This costs ~0.5% ratio on
+  // the benchmark corpora (inside the v0.1.2 regression budget) but removes
+  // most of the level's chain-search overhead.
+  if (level == 9 && strategy == CompressionStrategy.lazy2 && searchLog > 4) {
+    searchLog = 4;
   }
   return CompressionParameters(
     windowLog: row.$1,
@@ -257,6 +268,8 @@ final class MatchFinder {
     if (blockEnd - blockStart < 4) return;
     _history.restore(startRepCodes);
     _ensurePositionCapacity(streamBase + blockStart);
+    _data = data;
+    _dataView = ByteData.sublistView(data);
     switch (parameters.strategy) {
       case CompressionStrategy.fast:
         _findFast(data, blockStart, blockEnd, streamBase, store);
@@ -275,6 +288,8 @@ final class MatchFinder {
   void loadPrefix(Uint8List data, int start, int end, int streamBase) {
     if (end <= start) return;
     _ensurePositionCapacity(streamBase + start);
+    _data = data;
+    _dataView = ByteData.sublistView(data);
     final minLength = _minimumHashLength;
     final hashShift = 32 - parameters.hashLog;
     final hashMask = _hashTable.length - 1;
@@ -286,17 +301,16 @@ final class MatchFinder {
     final chainMask = chainTable == null ? 0 : chainTable.length - 1;
     for (var p = start; p + minLength <= end; p++) {
       final currentStream = streamBase + p;
-      final value = _storedPosition(currentStream);
+      final value = currentStream - _posBase + 1;
       if (doubleFast) {
         if (p + 8 <= end) {
-          final longHash = _hash(data, p, 8, hashShift) & hashMask;
+          final longHash = _hashAt(p, 8, hashShift) & hashMask;
           _hashTable[longHash] = value;
         }
-        final shortHash =
-            _hash(data, p, parameters.minMatch, shortShift) & shortMask;
+        final shortHash = _hashAt(p, minLength, shortShift) & shortMask;
         shortTable![shortHash] = value;
       } else {
-        final hash = _hash(data, p, parameters.minMatch, hashShift) & hashMask;
+        final hash = _hashAt(p, minLength, hashShift) & hashMask;
         final previous = _hashTable[hash];
         _hashTable[hash] = value;
         if (chainTable != null) {
@@ -315,18 +329,43 @@ final class MatchFinder {
     _posBase = blockStartPosition;
   }
 
-  int _storedPosition(int streamPosition) => streamPosition - _posBase + 1;
-
-  int _candidateLocal(int stored, int streamBase) {
-    final candidateStream = stored - 1 + _posBase;
-    return candidateStream - streamBase;
-  }
-
-  int _candidateOffset(int stored, int currentStream) =>
-      currentStream - (stored - 1 + _posBase);
-
   int get _minimumHashLength =>
       parameters.minMatch < 4 ? 4 : parameters.minMatch;
+
+  /// Hash of the [length] (4..8) bytes at [position].
+  ///
+  /// Reads whole 32-bit words through the cached [ByteData] view; for 5..7
+  /// byte matches the few extra bytes are folded in directly.
+  @pragma('vm:prefer-inline')
+  int _hashAt(int position, int length, int shift) {
+    final word = _read32(position);
+    if (length == 8) {
+      return hashes.mix8(word, _read32(position + 4), shift);
+    }
+    final data = _data!;
+    switch (length) {
+      case 4:
+        return hashes.mix4(word, shift);
+      case 5:
+        return hashes.mixExtra(word, data[position + 4], shift);
+      case 6:
+        return hashes.mixExtra(
+          word,
+          (data[position + 4] << 8) | data[position + 5],
+          shift,
+        );
+      case 7:
+        return hashes.mixExtra(
+          word,
+          (data[position + 4] << 16) |
+              (data[position + 5] << 8) |
+              data[position + 6],
+          shift,
+        );
+      default:
+        return hashes.mix4(word, shift);
+    }
+  }
 
   void _findFast(
     Uint8List data,
@@ -346,9 +385,9 @@ final class MatchFinder {
     var anchor = blockStart;
     while (ip <= limit) {
       final currentStream = streamBase + ip;
-      final hash = _hash(data, ip, minMatch, hashShift) & tableMask;
+      final hash = _hashAt(ip, minMatch, hashShift) & tableMask;
       final stored = _hashTable[hash];
-      _hashTable[hash] = _storedPosition(currentStream);
+      _hashTable[hash] = currentStream - _posBase + 1;
 
       final repLength = _repCodeMatch(data, ip, anchor, blockEnd, windowSize);
       if (repLength > 0) {
@@ -372,10 +411,10 @@ final class MatchFinder {
       }
 
       if (stored != 0) {
-        final offset = _candidateOffset(stored, currentStream);
+        final offset = currentStream - (stored - 1 + _posBase);
         if (offset > 0 && offset <= windowSize) {
-          final candidate = _candidateLocal(stored, streamBase);
-          if (candidate >= 0 && _read32(data, candidate) == _read32(data, ip)) {
+          final candidate = stored - 1 + _posBase - streamBase;
+          if (candidate >= 0 && _read32(candidate) == _read32(ip)) {
             var length = _countMatch(data, ip + 4, candidate + 4, blockEnd) + 4;
             var matchStart = ip;
             var matchCandidate = candidate;
@@ -416,7 +455,6 @@ final class MatchFinder {
     int streamBase,
     SequenceStore store,
   ) {
-    final minMatch = parameters.minMatch;
     final longShift = 32 - parameters.hashLog;
     final shortShift = 32 - parameters.chainLog;
     final longTableMask = _hashTable.length - 1;
@@ -426,11 +464,13 @@ final class MatchFinder {
     final limit = blockEnd - _minimumHashLength;
     final longLimit = blockEnd - 8;
     if (blockStart > limit) return;
+    final shortHashLength = parameters.minMatch;
 
     var ip = blockStart;
     var anchor = blockStart;
+    final baseDelta = streamBase - _posBase;
     while (ip <= limit) {
-      final currentStream = streamBase + ip;
+      final currentRel = ip + baseDelta;
 
       final repLength = _repCodeMatch(data, ip, anchor, blockEnd, windowSize);
       if (repLength > 0) {
@@ -458,18 +498,20 @@ final class MatchFinder {
       var bestOffset = 0;
       var bestCandidate = 0;
       var bestStart = ip;
+      final position32 = _read32(ip);
 
       if (ip <= longLimit) {
-        final longHash = _hash(data, ip, 8, longShift) & longTableMask;
+        final longHash =
+            hashes.mix8(position32, _read32(ip + 4), longShift) & longTableMask;
         final storedLong = _hashTable[longHash];
-        _hashTable[longHash] = _storedPosition(currentStream);
+        _hashTable[longHash] = currentRel + 1;
         if (storedLong != 0) {
-          final offset = _candidateOffset(storedLong, currentStream);
+          final offset = currentRel - storedLong + 1;
           if (offset > 0 && offset <= windowSize) {
-            final candidate = _candidateLocal(storedLong, streamBase);
+            final candidate = storedLong - 1 - baseDelta;
             if (candidate >= 0 &&
-                _read32(data, candidate) == _read32(data, ip) &&
-                _read32(data, candidate + 4) == _read32(data, ip + 4)) {
+                _read32(candidate) == position32 &&
+                _read32(candidate + 4) == _read32(ip + 4)) {
               bestLength =
                   _countMatch(data, ip + 8, candidate + 8, blockEnd) + 8;
               bestOffset = offset;
@@ -479,14 +521,21 @@ final class MatchFinder {
         }
       }
 
-      final shortHash = _hash(data, ip, minMatch, shortShift) & shortTableMask;
+      final int shortHash;
+      if (shortHashLength == 4) {
+        shortHash = hashes.mix4(position32, shortShift) & shortTableMask;
+      } else {
+        shortHash =
+            hashes.mixExtra(position32, data[ip + 4], shortShift) &
+            shortTableMask;
+      }
       final storedShort = shortTable[shortHash];
-      shortTable[shortHash] = _storedPosition(currentStream);
+      shortTable[shortHash] = currentRel + 1;
       if (storedShort != 0) {
-        final offset = _candidateOffset(storedShort, currentStream);
+        final offset = currentRel - storedShort + 1;
         if (offset > 0 && offset <= windowSize) {
-          final candidate = _candidateLocal(storedShort, streamBase);
-          if (candidate >= 0 && _read32(data, candidate) == _read32(data, ip)) {
+          final candidate = storedShort - 1 - baseDelta;
+          if (candidate >= 0 && _read32(candidate) == position32) {
             final length =
                 _countMatch(data, ip + 4, candidate + 4, blockEnd) + 4;
             if (length > bestLength) {
@@ -500,17 +549,19 @@ final class MatchFinder {
 
       // libzstd also tries a long match one byte ahead after finding a short
       // one, which recovers many long matches in structured text.
-      if (bestLength >= 4 && ip + 1 <= longLimit) {
-        final longHash1 = _hash(data, ip + 1, 8, longShift) & longTableMask;
+      if (bestLength >= 4 && bestLength < 6 && ip + 1 <= longLimit) {
+        final longHash1 =
+            hashes.mix8(_read32(ip + 1), _read32(ip + 5), longShift) &
+            longTableMask;
         final storedLong1 = _hashTable[longHash1];
         if (storedLong1 != 0) {
-          final offset = _candidateOffset(storedLong1, currentStream + 1);
+          final offset = currentRel - storedLong1 + 2;
           if (offset > 0 && offset <= windowSize) {
-            final candidate = _candidateLocal(storedLong1, streamBase);
+            final candidate = storedLong1 - 1 - baseDelta;
             if (candidate >= 0 &&
                 ip + 9 <= blockEnd &&
-                _read32(data, candidate) == _read32(data, ip + 1) &&
-                _read32(data, candidate + 4) == _read32(data, ip + 5)) {
+                _read32(candidate) == _read32(ip + 1) &&
+                _read32(candidate + 4) == _read32(ip + 5)) {
               final length =
                   _countMatch(data, ip + 9, candidate + 8, blockEnd) + 8;
               if (length > bestLength) {
@@ -553,7 +604,10 @@ final class MatchFinder {
         );
         continue;
       }
-      ip++;
+      // No match: like libzstd's fast parsers, skip further ahead as the
+      // current literal run grows. This keeps incompressible regions cheap
+      // while leaving compressible data's step at one or two bytes.
+      ip += ((ip - anchor) >> 8) + 1;
     }
   }
 
@@ -575,90 +629,118 @@ final class MatchFinder {
     if (blockStart > limit) return;
     final chainLazy = lazy;
     final lazy2 = parameters.strategy == CompressionStrategy.lazy2;
+    final searchDepth = parameters.searchDepth;
+    final hashLength = _minimumHashLength;
+    final history = _history;
+    final hashTable = _hashTable;
+    final maxDepth = chainLazy ? (lazy2 ? 2 : 1) : 0;
 
     var ip = blockStart;
     var anchor = blockStart;
-
     var nextToInsert = blockStart;
-
-    void insertPosition(int p) {
-      final currentStream = streamBase + p;
-      final hash = _hash(data, p, parameters.minMatch, hashShift) & hashMask;
-      final previous = _hashTable[hash];
-      _hashTable[hash] = _storedPosition(currentStream);
-      chainTable[(currentStream - _posBase) & chainMask] = previous;
-    }
-
-    MatchSearchResult search(int position) {
-      // Insert every position skipped since the last search, like libzstd's
-      // ZSTD_insertAndFindFirstIndex: this keeps the chains dense after long
-      // matches, which is essential for ratio.
-      if (position > nextToInsert) {
-        var stop = position - 1;
-        if (stop > limit) stop = limit;
-        for (var p = nextToInsert; p <= stop; p++) {
-          insertPosition(p);
-        }
-        nextToInsert = stop + 1;
-      }
-      final currentStream = streamBase + position;
-      final hash =
-          _hash(data, position, parameters.minMatch, hashShift) & hashMask;
-      final previous = _hashTable[hash];
-      _hashTable[hash] = _storedPosition(currentStream);
-      chainTable[(currentStream - _posBase) & chainMask] = previous;
-      nextToInsert = position + 1;
-
-      var bestLength = 0;
-      var bestOffset = 0;
-      var candidate = previous;
-      var attempts = parameters.searchDepth;
-      final maxLength = blockEnd - position;
-      while (attempts-- > 0 && candidate != 0) {
-        final candidateStream = candidate - 1 + _posBase;
-        final offset = currentStream - candidateStream;
-        if (offset <= 0 || offset > windowSize) break;
-        final candidateLocal = candidateStream - streamBase;
-        if (candidateLocal < 0) break;
-        if (_read32(data, candidateLocal) == _read32(data, position)) {
-          final length =
-              _countMatch(data, position + 4, candidateLocal + 4, blockEnd) + 4;
-          if (length > bestLength) {
-            bestLength = length;
-            bestOffset = offset;
-            if (length >= maxLength) break;
-          }
-        }
-        final next = chainTable[(candidateStream - _posBase) & chainMask];
-        if (next == 0) break;
-        if (next - 1 + _posBase >= candidateStream) break;
-        candidate = next;
-      }
-      return MatchSearchResult(bestLength, bestOffset);
-    }
+    // Relative positions: stream position minus _posBase. Working in this
+    // space avoids repeated additions in the innermost loops.
+    final baseDelta = streamBase - _posBase;
 
     while (ip <= limit) {
-      final match = search(ip);
-      var bestLength = match.length;
-      var bestOffset = match.offset;
+      var bestLength = 0;
+      var bestOffset = 0;
       var bestPosition = ip;
+      var position = ip;
+      var depth = 0;
 
-      // Baseline repeat-offset candidate (cheap when it is nearly as long).
-      final repLength = _repCodeMatch(data, ip, anchor, blockEnd, windowSize);
-      if (repLength >= 4 &&
-          repLength * 3 > _repGainAgainst(bestLength, bestOffset)) {
-        bestLength = repLength;
-        bestOffset = _history.rep1;
-        bestPosition = ip;
-      }
+      while (true) {
+        // Insert every position skipped since the last search, like libzstd's
+        // ZSTD_insertAndFindFirstIndex: this keeps chains dense after long
+        // matches, which is essential for ratio.
+        while (nextToInsert < position && nextToInsert <= limit) {
+          final insertRel = nextToInsert + baseDelta;
+          final insertHash =
+              _hashAt(nextToInsert, hashLength, hashShift) & hashMask;
+          final insertPrevious = hashTable[insertHash];
+          hashTable[insertHash] = insertRel + 1;
+          chainTable[insertRel & chainMask] = insertPrevious;
+          nextToInsert++;
+        }
+        if (nextToInsert < position) nextToInsert = position;
 
-      if (bestLength >= 4 && chainLazy) {
-        final maxDepth = lazy2 ? 2 : 1;
-        for (var depth = 1; depth <= maxDepth; depth++) {
-          final position = ip + depth;
-          if (position > limit) break;
+        final currentRel = position + baseDelta;
+        final hash = _hashAt(position, hashLength, hashShift) & hashMask;
+        final previous = hashTable[hash];
+        hashTable[hash] = currentRel + 1;
+        chainTable[currentRel & chainMask] = previous;
+        nextToInsert = position + 1;
+
+        var candidateLength = 0;
+        var candidateOffset = 0;
+        var candidate = previous;
+        var attempts = searchDepth;
+        final maxLength = blockEnd - position;
+        while (attempts-- > 0 && candidate != 0) {
+          final offset = currentRel - candidate + 1;
+          if (offset <= 0 || offset > windowSize) break;
+          final candidateLocal = candidate - 1 - baseDelta;
+          if (candidateLocal < 0) break;
+          // Cheap rejection: a candidate that cannot extend past the current
+          // best by more than a few bytes is not worth a full comparison.
+          // The four-byte probe may match on a hash collision, so the full
+          // comparison must start at position 0, not at position + 4.
+          if (candidateLength == 0) {
+            if (_read32(candidateLocal) == _read32(position)) {
+              final length = _countMatch(
+                data,
+                position,
+                candidateLocal,
+                blockEnd,
+              );
+              if (length > candidateLength) {
+                candidateLength = length;
+                candidateOffset = offset;
+                if (length >= maxLength) break;
+              }
+            }
+          } else {
+            final probe = position + candidateLength - 3;
+            if (probe + 4 <= blockEnd &&
+                _read32(candidateLocal + candidateLength - 3) ==
+                    _read32(probe)) {
+              final length = _countMatch(
+                data,
+                position,
+                candidateLocal,
+                blockEnd,
+              );
+              if (length > candidateLength) {
+                candidateLength = length;
+                candidateOffset = offset;
+                if (length >= maxLength) break;
+              }
+            }
+          }
+          final next = chainTable[(candidate - 1) & chainMask];
+          if (next == 0) break;
+          if (next >= candidate) break;
+          candidate = next;
+        }
+
+        if (depth == 0) {
+          bestLength = candidateLength;
+          bestOffset = candidateOffset;
+          final repLength = _repCodeMatch(
+            data,
+            position,
+            anchor,
+            blockEnd,
+            windowSize,
+          );
+          if (repLength >= 4 &&
+              repLength * 3 > _repGainAgainst(bestLength, bestOffset)) {
+            bestLength = repLength;
+            bestOffset = history.rep1;
+          }
+          if (bestLength < 4 || maxDepth == 0) break;
+        } else {
           var improved = false;
-
           final candidateRep = _repCodeMatch(
             data,
             position,
@@ -669,22 +751,25 @@ final class MatchFinder {
           if (candidateRep >= 4 &&
               candidateRep * 3 > _repGainAgainst(bestLength, bestOffset)) {
             bestLength = candidateRep;
-            bestOffset = _history.rep1;
+            bestOffset = history.rep1;
             bestPosition = position;
             improved = true;
           }
-
-          final candidate = search(position);
-          if (candidate.length >= 4 &&
-              candidate.length * 4 - _highBit32(candidate.offset) >
+          if (candidateLength >= 4 &&
+              candidateLength * 4 - _highBit32(candidateOffset) >
                   _hashGainAgainst(bestLength, bestOffset)) {
-            bestLength = candidate.length;
-            bestOffset = candidate.offset;
+            bestLength = candidateLength;
+            bestOffset = candidateOffset;
             bestPosition = position;
             improved = true;
           }
           if (!improved) break;
         }
+
+        depth++;
+        if (depth > maxDepth) break;
+        position = ip + depth;
+        if (position > limit) break;
       }
 
       if (bestLength < 4) {
@@ -703,7 +788,7 @@ final class MatchFinder {
         length++;
       }
       final litLength = matchStart - anchor;
-      _history.encodeOffset(litLength, bestOffset);
+      history.encodeOffset(litLength, bestOffset);
       store.add(litLength, length, bestOffset);
       ip = matchStart + length;
       ip = _storeImmediateReps(data, ip, blockEnd, windowSize, store);
@@ -746,7 +831,7 @@ final class MatchFinder {
       if (offset <= 0 || offset > windowSize) break;
       final candidate = ip - offset;
       if (candidate < 0) break;
-      if (_read32(data, candidate) != _read32(data, ip)) break;
+      if (_read32(candidate) != _read32(ip)) break;
       final length = _countMatch(data, ip + 4, candidate + 4, blockEnd) + 4;
       _history.encodeOffset(0, offset);
       store.add(0, length, offset);
@@ -771,7 +856,7 @@ final class MatchFinder {
     if (offset <= 0 || offset > windowSize) return 0;
     final candidate = position - offset;
     if (candidate < 0 || position + 4 > blockEnd) return 0;
-    if (_read32(data, candidate) != _read32(data, position)) return 0;
+    if (_read32(candidate) != _read32(position)) return 0;
     return _countMatch(data, position + 4, candidate + 4, blockEnd) + 4;
   }
 
@@ -784,11 +869,13 @@ final class MatchFinder {
     int hashShift,
     int tableMask,
   ) {
+    final hashLength = _minimumHashLength;
+    final hashTable = _hashTable;
     for (var back = 1; back <= 2; back++) {
       final p = position - back;
       if (p < blockStart || p > limit) continue;
-      final hash = _hash(data, p, parameters.minMatch, hashShift) & tableMask;
-      _hashTable[hash] = _storedPosition(streamBase + p);
+      final hash = _hashAt(p, hashLength, hashShift) & tableMask;
+      hashTable[hash] = streamBase + p - _posBase + 1;
     }
   }
 
@@ -807,41 +894,45 @@ final class MatchFinder {
   ) {
     final shortTable = _shortHashTable!;
     final shortMask = shortTable.length - 1;
-    final longMask = _hashTable.length - 1;
+    final longTable = _hashTable;
+    final longMask = longTable.length - 1;
     final shortLimit = blockEnd - _minimumHashLength;
     final longLimit = blockEnd - 8;
-    void insertAt(int p) {
-      if (p < blockStart || p >= position) return;
-      final value = _storedPosition(streamBase + p);
-      if (p <= shortLimit) {
-        final shortHash =
-            _hash(data, p, parameters.minMatch, shortShift) & shortMask;
+    final shortHashLength = parameters.minMatch;
+    final candidate0 = position - 1;
+    final candidate1 = position - 2;
+    final candidate2 = matchStart;
+    final candidate3 = matchStart + 2;
+    for (var index = 0; index < 4; index++) {
+      final p = index == 0
+          ? candidate0
+          : (index == 1 ? candidate1 : (index == 2 ? candidate2 : candidate3));
+      if (p < blockStart || p >= position) continue;
+      final value = streamBase + p - _posBase + 1;
+      if (p <= shortLimit && (index == 0 || index == 3)) {
+        final shortHash = _hashAt(p, shortHashLength, shortShift) & shortMask;
         shortTable[shortHash] = value;
       }
       if (p <= longLimit) {
-        final longHash = _hash(data, p, 8, longShift) & longMask;
-        _hashTable[longHash] = value;
+        final longHash = _hashAt(p, 8, longShift) & longMask;
+        longTable[longHash] = value;
       }
     }
-
-    insertAt(position - 1);
-    insertAt(position - 2);
-    insertAt(matchStart);
-    insertAt(matchStart + 2);
   }
 
-  static int _read32(Uint8List data, int offset) =>
-      data[offset] |
-      (data[offset + 1] << 8) |
-      (data[offset + 2] << 16) |
-      (data[offset + 3] << 24);
+  ByteData? _dataView;
+  Uint8List? _data;
 
-  static int _countMatch(Uint8List data, int a, int b, int limit) {
+  @pragma('vm:prefer-inline')
+  int _read32(int offset) => _dataView!.getUint32(offset, Endian.little);
+
+  @pragma('vm:prefer-inline')
+  int _countMatch(Uint8List data, int a, int b, int limit) {
     final available = limit - a;
     if (available <= 0) return 0;
     var matched = 0;
     while (matched + 4 <= available) {
-      if (_read32(data, a + matched) != _read32(data, b + matched)) break;
+      if (_read32(a + matched) != _read32(b + matched)) break;
       matched += 4;
     }
     while (a + matched < limit && data[a + matched] == data[b + matched]) {
@@ -849,34 +940,4 @@ final class MatchFinder {
     }
     return matched;
   }
-
-  static int _mul32(int a, int b) {
-    final low = (a & 0xFFFF) * b;
-    final high = ((a >>> 16) & 0xFFFF) * b;
-    return (low + ((high & 0xFFFF) << 16)) & 0xFFFFFFFF;
-  }
-
-  /// zstd's 4-byte multiplicative hash, extended to `length` bytes.
-  static int _hash(Uint8List data, int p, int length, int shift) {
-    final word =
-        data[p] |
-        (data[p + 1] << 8) |
-        (data[p + 2] << 16) |
-        (data[p + 3] * 0x1000000);
-    var hash = _mul32(word, 0x9E3779B1);
-    if (length > 4) {
-      var extra = 0;
-      for (var i = 4; i < length; i++) {
-        extra = (extra << 8) | data[p + i];
-      }
-      hash = _mul32(hash ^ extra, 0x9E3779B1);
-    }
-    return hash >>> shift;
-  }
-}
-
-final class MatchSearchResult {
-  const MatchSearchResult(this.length, this.offset);
-  final int length;
-  final int offset;
 }

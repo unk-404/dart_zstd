@@ -229,6 +229,15 @@ final class RepeatOffsetHistory {
   }
 }
 
+/// Precomputed log2 values for normalized FSE probabilities (1..512).
+final Float64List _log2Table = () {
+  final table = Float64List(1025);
+  for (var i = 1; i < table.length; i++) {
+    table[i] = math.log(i) / math.ln2;
+  }
+  return table;
+}();
+
 /// One selected entropy-table choice for one symbol type.
 final class SequenceTableChoice {
   SequenceTableChoice({
@@ -238,7 +247,6 @@ final class SequenceTableChoice {
     this.tableLog = 0,
     this.maxSymbol = 0,
     this.rleSymbol = 0,
-    this.ncount,
   });
 
   final int mode;
@@ -247,7 +255,6 @@ final class SequenceTableChoice {
   final int tableLog;
   final int maxSymbol;
   final int rleSymbol;
-  final Uint8List? ncount;
 
   SequenceTableChoice repeated() => SequenceTableChoice(
     mode: sequenceModeRepeat,
@@ -276,6 +283,16 @@ final class SequenceTableSnapshot {
 final class SequenceWriter {
   /// Repeat-offset history shared across the blocks of a frame.
   final RepeatOffsetHistory history;
+
+  /// Reused bit accumulator for the sequence bitstream.
+  final BitWriter _bitWriter = BitWriter(4096);
+
+  /// Reused scratch buffer for estimating FSE table-description sizes.
+  final ByteWriter _ncountScratch = ByteWriter(64);
+
+  final Int32List _llCounts = Int32List(36);
+  final Int32List _ofCounts = Int32List(32);
+  final Int32List _mlCounts = Int32List(53);
 
   SequenceTableChoice? _llPrevious;
   SequenceTableChoice? _ofPrevious;
@@ -334,6 +351,7 @@ final class SequenceWriter {
       defaultMaxSymbol: _defaultMaxLlSymbol,
       previous: _llPrevious,
       defaultTable: _llTable,
+      counts: _llCounts,
     );
     final ofChoice = _select(
       codes: ofCodes,
@@ -345,6 +363,7 @@ final class SequenceWriter {
       defaultMaxSymbol: _defaultMaxOfSymbol,
       previous: _ofPrevious,
       defaultTable: _ofTable,
+      counts: _ofCounts,
     );
     final mlChoice = _select(
       codes: mlCodes,
@@ -356,6 +375,7 @@ final class SequenceWriter {
       defaultMaxSymbol: _defaultMaxMlSymbol,
       previous: _mlPrevious,
       defaultTable: _mlTable,
+      counts: _mlCounts,
     );
 
     output.writeByte(
@@ -369,46 +389,82 @@ final class SequenceWriter {
     _ofPrevious = ofChoice.repeatable ? ofChoice : null;
     _mlPrevious = mlChoice.repeatable ? mlChoice : null;
 
-    final bitWriter = BitWriter(output);
+    final bitWriter = _bitWriter..reset();
     final last = count - 1;
-    var llState = llChoice.table.initStateForSymbol(llCodes[last]);
-    var ofState = ofChoice.table.initStateForSymbol(ofCodes[last]);
-    var mlState = mlChoice.table.initStateForSymbol(mlCodes[last]);
-    _addExtraBits(
-      bitWriter,
-      store.litLengths[last],
-      llCodes[last],
-      store.matchLengths[last],
-      mlCodes[last],
-      offsetValues[last],
-      ofCodes[last],
-    );
+    final llTable = llChoice.table;
+    final ofTable = ofChoice.table;
+    final mlTable = mlChoice.table;
+    final llStateTable = llTable.stateTable;
+    final llDeltaNbBits = llTable.deltaNbBits;
+    final llDeltaFindState = llTable.deltaFindState;
+    final ofStateTable = ofTable.stateTable;
+    final ofDeltaNbBits = ofTable.deltaNbBits;
+    final ofDeltaFindState = ofTable.deltaFindState;
+    final mlStateTable = mlTable.stateTable;
+    final mlDeltaNbBits = mlTable.deltaNbBits;
+    final mlDeltaFindState = mlTable.deltaFindState;
+    var llState = llTable.initStateForSymbol(llCodes[last]);
+    var ofState = ofTable.initStateForSymbol(ofCodes[last]);
+    var mlState = mlTable.initStateForSymbol(mlCodes[last]);
 
+    final lastLlCode = llCodes[last];
+    final lastMlCode = mlCodes[last];
+    final lastOfCode = ofCodes[last];
+    bitWriter.addBits(
+      store.litLengths[last] - _llBaseline[lastLlCode],
+      _llBits[lastLlCode],
+    );
+    bitWriter.addBits(
+      store.matchLengths[last] - 3 - _mlBaseline[lastMlCode],
+      _mlBits[lastMlCode],
+    );
+    bitWriter.addBits(offsetValues[last] - (1 << lastOfCode), lastOfCode);
+
+    // Encoded backwards (last sequence first), exactly like the reference.
     for (var i = last - 1; i >= 0; i--) {
-      ofState = ofChoice.table.encodeSymbol(bitWriter, ofState, ofCodes[i]);
-      mlState = mlChoice.table.encodeSymbol(bitWriter, mlState, mlCodes[i]);
-      llState = llChoice.table.encodeSymbol(bitWriter, llState, llCodes[i]);
-      _addExtraBits(
-        bitWriter,
-        store.litLengths[i],
-        llCodes[i],
-        store.matchLengths[i],
-        mlCodes[i],
-        offsetValues[i],
-        ofCodes[i],
+      final ofCode = ofCodes[i];
+      var nbBits = (ofState + ofDeltaNbBits[ofCode]) >> 16;
+      bitWriter.addBits(ofState, nbBits);
+      ofState = ofStateTable[(ofState >> nbBits) + ofDeltaFindState[ofCode]];
+
+      final mlCode = mlCodes[i];
+      nbBits = (mlState + mlDeltaNbBits[mlCode]) >> 16;
+      bitWriter.addBits(mlState, nbBits);
+      mlState = mlStateTable[(mlState >> nbBits) + mlDeltaFindState[mlCode]];
+
+      final llCode = llCodes[i];
+      nbBits = (llState + llDeltaNbBits[llCode]) >> 16;
+      bitWriter.addBits(llState, nbBits);
+      llState = llStateTable[(llState >> nbBits) + llDeltaFindState[llCode]];
+
+      bitWriter.addBits(
+        store.litLengths[i] - _llBaseline[llCode],
+        _llBits[llCode],
       );
+      bitWriter.addBits(
+        store.matchLengths[i] - 3 - _mlBaseline[mlCode],
+        _mlBits[mlCode],
+      );
+      bitWriter.addBits(offsetValues[i] - (1 << ofCode), ofCode);
     }
 
     // Flushed in decoder-read order: match lengths, offsets, literals lengths.
-    mlChoice.table.flushState(bitWriter, mlState);
-    ofChoice.table.flushState(bitWriter, ofState);
-    llChoice.table.flushState(bitWriter, llState);
+    bitWriter.addBits(mlState, mlTable.tableLog);
+    bitWriter.addBits(ofState, ofTable.tableLog);
+    bitWriter.addBits(llState, llTable.tableLog);
     bitWriter.finish();
+    output.writeBytes(bitWriter.bytes);
+    bitWriter.reset();
   }
 
   void _writeChoiceTable(ByteWriter output, SequenceTableChoice choice) {
     if (choice.mode == sequenceModeFse) {
-      output.writeBytes(choice.ncount!);
+      writeFseNCount(
+        output,
+        choice.normalized!,
+        choice.maxSymbol,
+        choice.tableLog,
+      );
     } else if (choice.mode == sequenceModeRle) {
       output.writeByte(choice.rleSymbol);
     }
@@ -424,8 +480,9 @@ final class SequenceWriter {
     required int defaultMaxSymbol,
     required SequenceTableChoice? previous,
     required FseCTable defaultTable,
+    required Int32List counts,
   }) {
-    final counts = Int32List(maxSymbolAllowed + 1);
+    counts.fillRange(0, counts.length, 0);
     var maxPresent = -1;
     var mostFrequent = 0;
     for (var i = 0; i < nbSeq; i++) {
@@ -499,11 +556,10 @@ final class SequenceWriter {
         total: nbSeq,
         tableLog: tableLog,
       );
-      final ncountWriter = ByteWriter(64);
-      writeFseNCount(ncountWriter, normalized, maxPresent, tableLog);
-      final ncount = ncountWriter.takeBytes();
+      _ncountScratch.clear();
+      writeFseNCount(_ncountScratch, normalized, maxPresent, tableLog);
       final customCost =
-          ncount.length * 8 +
+          _ncountScratch.length * 8 +
           _entropyBits(normalized, maxPresent, tableLog, counts);
       if (customCost < bestCost) {
         best = SequenceTableChoice(
@@ -512,7 +568,6 @@ final class SequenceWriter {
           normalized: normalized,
           tableLog: tableLog,
           maxSymbol: maxPresent,
-          ncount: ncount,
         );
         bestCost = customCost;
       }
@@ -557,29 +612,9 @@ final class SequenceWriter {
       var probability = normalized[s];
       if (probability == 0) return double.infinity;
       if (probability == -1) probability = 1;
-      bits += c * (tableLog - math.log(probability) / math.ln2);
+      bits += c * (tableLog - _log2Table[probability]);
     }
     return bits;
-  }
-
-  void _addExtraBits(
-    BitWriter bitWriter,
-    int litLength,
-    int litLengthCode,
-    int matchLength,
-    int matchLengthCode,
-    int offsetValue,
-    int offsetCode,
-  ) {
-    bitWriter.addBits(
-      litLength - _llBaseline[litLengthCode],
-      _llBits[litLengthCode],
-    );
-    bitWriter.addBits(
-      matchLength - 3 - _mlBaseline[matchLengthCode],
-      _mlBits[matchLengthCode],
-    );
-    bitWriter.addBits(offsetValue - (1 << offsetCode), offsetCode);
   }
 
   void _writeNumberOfSequences(ByteWriter output, int count) {

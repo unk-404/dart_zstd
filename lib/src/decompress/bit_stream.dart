@@ -63,6 +63,43 @@ const List<int> kPow2 = <int>[
   2199023255552,
 ];
 
+/// Bit masks for widths `0..32`.
+const List<int> kBitMasks = <int>[
+  0,
+  1,
+  3,
+  7,
+  15,
+  31,
+  63,
+  127,
+  255,
+  511,
+  1023,
+  2047,
+  4095,
+  8191,
+  16383,
+  32767,
+  65535,
+  131071,
+  262143,
+  524287,
+  1048575,
+  2097151,
+  4194303,
+  8388607,
+  16777215,
+  33554431,
+  67108863,
+  134217727,
+  268435455,
+  536870911,
+  1073741823,
+  2147483647,
+  4294967295,
+];
+
 /// Index of the highest set bit of [value] (`value > 0`).
 int highestSetBit(int value) {
   var v = value;
@@ -197,9 +234,15 @@ final class ForwardBitReader {
 
 /// Backward bit reader for FSE and Huffman payloads.
 ///
+/// The reader keeps a 32-bit little-endian window ("container") covering four
+/// input bytes and refills it backwards a whole number of bytes at a time,
+/// exactly like libzstd's 32-bit `BIT_DStream_t`. This turns the hot
+/// `readBits` path into a shift, a mask and two field updates.
+///
 /// [end] is exclusive. The last byte must contain the final `1` flag, so it
-/// cannot be zero. `bitPosition` counts useful bits (it starts at
-/// `(end - start) * 8 - padding - 1 + 1` and decreases as fields are read).
+/// cannot be zero. `bitPosition` counts the remaining useful bits; it may go
+/// negative when a truncated stream is read, and the zero-bit padding then
+/// models the end of stream exactly like libzstd.
 final class BackwardBitReader {
   BackwardBitReader(this.data, this.start, this.end) {
     if (end <= start) {
@@ -215,18 +258,61 @@ final class BackwardBitReader {
         'last back-reference bit stream byte is zero',
       );
     }
-    _bitPosition = (end - start - 1) * 8 + highestSetBit(lastByte);
+    // The window covers the last (up to) four bytes of the stream; bytes past
+    // `end` read as zero, which gives the same padding as libzstd.
+    var windowStart = end - 4;
+    if (windowStart < start) windowStart = start;
+    _ptr = windowStart;
+    _container = _loadContainer(windowStart);
+    final inWindow = (end - windowStart - 1) * 8 + highestSetBit(lastByte);
+    _bitsConsumed = 32 - inWindow;
   }
 
   final Uint8List data;
   final int start;
   final int end;
 
-  int _bitPosition = 0;
+  int _ptr = 0;
+  int _container = 0;
+  int _bitsConsumed = 0;
 
-  /// Number of unread bits. May go negative when a truncated stream is read;
-  /// the zero-bit padding then models the end of stream, exactly like libzstd.
-  int get bitPosition => _bitPosition;
+  /// Number of unread bits (may be negative for truncated streams).
+  int get bitPosition => (_ptr - start) * 8 + 32 - _bitsConsumed;
+
+  /// Bits currently available in the window without a refill.
+  int get windowBits => 32 - _bitsConsumed;
+
+  /// Window state accessors used by [BitWindow] (which copies the fields into
+  /// locals for the hot loops).
+  int get windowContainer => _container;
+  int get windowPtr => _ptr;
+  int get windowConsumed => _bitsConsumed;
+
+  void restoreWindow(int container, int ptr, int bitsConsumed) {
+    _container = container;
+    _ptr = ptr;
+    _bitsConsumed = bitsConsumed;
+  }
+
+  int _loadContainer(int windowStart) {
+    final b0 = windowStart < end ? data[windowStart] : 0;
+    final b1 = windowStart + 1 < end ? data[windowStart + 1] : 0;
+    final b2 = windowStart + 2 < end ? data[windowStart + 2] : 0;
+    final b3 = windowStart + 3 < end ? data[windowStart + 3] : 0;
+    return b0 + (b1 << 8) + (b2 << 16) + b3 * 16777216;
+  }
+
+  /// Slides the window towards [start] by whole consumed bytes.
+  void _refill() {
+    if (_ptr <= start) return;
+    var nbBytes = _bitsConsumed >> 3;
+    if (nbBytes <= 0) return;
+    final available = _ptr - start;
+    if (nbBytes > available) nbBytes = available;
+    _ptr -= nbBytes;
+    _bitsConsumed -= nbBytes * 8;
+    _container = _loadContainer(_ptr);
+  }
 
   int readBits(int n) {
     if (n == 0) return 0;
@@ -236,42 +322,97 @@ final class BackwardBitReader {
         'invalid back-reference bit count',
       );
     }
-    final newPosition = _bitPosition - n;
-    int value;
-    if (newPosition >= 0) {
-      if (n <= 16) {
-        // Fast path for the Huffman and FSE hot loops: at most three bytes are
-        // touched, and all shifts stay below 32 bits on every platform.
-        final bytePosition = start + (newPosition >> 3);
-        final bitOffset = newPosition & 7;
-        final bitsNeeded = bitOffset + n;
-        if (bitsNeeded <= 8) {
-          value = (data[bytePosition] >> bitOffset) & ((1 << n) - 1);
-        } else if (bitsNeeded <= 16) {
-          value =
-              ((data[bytePosition] | (data[bytePosition + 1] << 8)) >>
-                  bitOffset) &
-              ((1 << n) - 1);
-        } else {
-          value =
-              ((data[bytePosition] |
-                      (data[bytePosition + 1] << 8) |
-                      (data[bytePosition + 2] << 16)) >>
-                  bitOffset) &
-              ((1 << n) - 1);
-        }
-      } else {
-        value = readBitsLe(data, start, newPosition, n);
-      }
-    } else {
-      final available = _bitPosition;
-      if (available <= 0) {
-        value = 0;
-      } else {
-        value = readBitsLe(data, start, 0, available) * kPow2[-newPosition];
+    if (n > 24) {
+      // A 32-bit window guarantees 25 bits after a refill; longer fields are
+      // read as a high part plus an 8-bit low part (same bit order).
+      final high = readBits(n - 8);
+      final low = readBits(8);
+      return high * 256 + low;
+    }
+    var available = 32 - _bitsConsumed;
+    if (available < n) {
+      _refill();
+      available = 32 - _bitsConsumed;
+    }
+    if (available < n) {
+      // Reading past the start: the low-order bits are zero-extended, the
+      // remaining stream bits are shifted up (identical to libzstd).
+      final have = available < 0 ? 0 : available;
+      final value = have == 0 ? 0 : (_container & kBitMasks[have]);
+      _bitsConsumed += n;
+      return value * kPow2[n - have];
+    }
+    final value = (_container >>> (32 - _bitsConsumed - n)) & kBitMasks[n];
+    _bitsConsumed += n;
+    return value;
+  }
+}
+
+/// Hot-loop view over a [BackwardBitReader].
+///
+/// The FSE and Huffman decoders read several small fields per step. Copying the
+/// three window fields into locals and reading through the small
+/// [readBits] method lets the optimizer inline the common path; the rare
+/// refill/end-of-stream path lives in a separate method so it does not bloat
+/// the hot code.
+final class BitWindow {
+  BitWindow(this.reader)
+    : container = reader.windowContainer,
+      ptr = reader.windowPtr,
+      bitsConsumed = reader.windowConsumed;
+
+  final BackwardBitReader reader;
+  int container;
+  int ptr;
+  int bitsConsumed;
+
+  /// Number of unread bits; may be negative for truncated streams.
+  int get bitPosition => (ptr - reader.start) * 8 + 32 - bitsConsumed;
+
+  int get windowBits => 32 - bitsConsumed;
+
+  /// Writes the window state back to the owning reader.
+  void flush() {
+    reader.restoreWindow(container, ptr, bitsConsumed);
+  }
+
+  @pragma('vm:prefer-inline')
+  int readBits(int n) {
+    if (n == 0) return 0;
+    if (32 - bitsConsumed < n) return _slowReadBits(n);
+    final value = (container >>> (32 - bitsConsumed - n)) & kBitMasks[n];
+    bitsConsumed += n;
+    return value;
+  }
+
+  int _slowReadBits(int n) {
+    if (n > 24) {
+      final high = readBits(n - 8);
+      final low = readBits(8);
+      return high * 256 + low;
+    }
+    final start = reader.start;
+    if (ptr > start) {
+      var nbBytes = bitsConsumed >> 3;
+      if (nbBytes <= 0) nbBytes = 0;
+      final available = ptr - start;
+      if (nbBytes > available) nbBytes = available;
+      if (nbBytes > 0) {
+        ptr -= nbBytes;
+        bitsConsumed -= nbBytes * 8;
+        container = reader._loadContainer(ptr);
       }
     }
-    _bitPosition = newPosition;
+    if (32 - bitsConsumed < n) {
+      // End of stream: low-order bits are zero-extended.
+      final have = 32 - bitsConsumed;
+      final present = have < 0 ? 0 : have;
+      final value = present == 0 ? 0 : (container & kBitMasks[present]);
+      bitsConsumed += n;
+      return value * kPow2[n - present];
+    }
+    final value = (container >>> (32 - bitsConsumed - n)) & kBitMasks[n];
+    bitsConsumed += n;
     return value;
   }
 }

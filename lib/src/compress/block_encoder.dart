@@ -1,5 +1,6 @@
 import 'dart:typed_data';
 
+import 'bit_writer.dart';
 import 'byte_writer.dart';
 import 'frame.dart';
 import 'huffman.dart';
@@ -18,7 +19,8 @@ final class BlockEncoder {
       _writer = SequenceWriter(initialRepCodes: initialRepCodes),
       _literals = Uint8List(parameters.blockSize),
       _literalCounts = Uint32List(256),
-      _literalsBody = ByteWriter(parameters.blockSize + 512);
+      _literalsBody = ByteWriter(parameters.blockSize + 512),
+      _huffmanBits = BitWriter(parameters.blockSize + 16);
 
   final CompressionParameters parameters;
   final MatchFinder _matcher;
@@ -28,6 +30,8 @@ final class BlockEncoder {
   final Uint8List _literals;
   final Uint32List _literalCounts;
   final ByteWriter _literalsBody;
+  final BitWriter _huffmanBits;
+  final HuffmanScratch _huffmanScratch = HuffmanScratch();
 
   HuffmanTable? _previousHuffman;
 
@@ -181,7 +185,7 @@ final class BlockEncoder {
       return;
     }
 
-    final table = buildHuffmanTable(_literalCounts);
+    final table = buildHuffmanTable(_literalCounts, scratch: _huffmanScratch);
     final treeDescription = table == null
         ? null
         : writeHuffmanTreeDescription(table);
@@ -224,6 +228,7 @@ final class BlockEncoder {
       literalCount,
       chosenTable,
       fourStreams: fourStreams,
+      scratch: _huffmanBits,
     );
     body.writeBytes(streams);
 

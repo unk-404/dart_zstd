@@ -1,19 +1,21 @@
-﻿# zstd_neo
+# zstd_neo
 
 A from-scratch, **pure Dart** implementation of the
 [Zstandard](https://facebook.github.io/zstd/) compression format.
 
-- Runs on the Dart VM, dart2js and dart2wasm 鈥?no FFI, no native libraries.
+- Runs on the Dart VM, dart2js and dart2wasm — no FFI, no native libraries.
 - Complete Zstandard decoder, including dictionaries, skippable frames,
   concatenated frames, content checksums and streaming.
 - Streaming encoder with `Converter` / `startChunkedConversion`, plus a
   one-shot fast path.
 
-> **Status: v0.1.2 (development).** Format conformance is verified against the
-> official zstd `decodecorpus` corpus; the remaining v0.1.2 phase is performance.
-> The encoder covers levels 1鈥?9 with Huffman literals (1/4 streams, treeless
+> **Status: v0.1.2 (production).** Format conformance is verified against the
+> official zstd `decodecorpus` corpus, and the v0.1.2 performance phase improved
+> the AOT encoder by roughly 1.55x/1.85x/2.21x at levels 3/9/19 and the AOT
+> decoder by roughly 1.5x, with smaller but real JS/Wasm gains.
+> The encoder covers levels 1–19 with Huffman literals (1/4 streams, treeless
 > repeat), custom FSE sequence tables, repeat/RLE modes and raw/formatted
-> dictionary support. Levels 10鈥?9 use a deeper-search lazy2 parser rather than
+> dictionary support. Levels 10–19 use a deeper-search lazy2 parser rather than
 > the reference `btopt`, so they produce valid frames and competitive ratios but
 > may trail libzstd at the very highest levels.
 
@@ -90,17 +92,17 @@ set `maxOutputSize` (and optionally a smaller `maxWindowSize`).
 
 | Feature | Decode | Encode |
 | --- | :---: | :---: |
-| Raw / RLE / compressed blocks | 鉁?| 鉁?|
-| Raw / RLE literals | 鉁?| 鉁?|
-| Huffman literals, 1 & 4 streams | 鉁?| 鉁?|
-| Treeless literals / repeat Huffman | 鉁?| 鉁?|
-| Predefined / RLE / FSE / repeat sequence tables | 鉁?| 鉁?|
-| Repeat offsets | 鉁?| 鉁?|
-| Content checksum (XXH64) | 鉁?| optional |
-| Frame content size / single segment | 鉁?| one-shot |
-| Skippable frames, concatenated frames | 鉁?| 鈥?|
-| Structured & raw dictionaries | 鉁?| 鉁?|
-| Streaming | 鉁?| 鉁?|
+| Raw / RLE / compressed blocks | ✓ | ✓ |
+| Raw / RLE literals | ✓ | ✓ |
+| Huffman literals, 1 & 4 streams | ✓ | ✓ |
+| Treeless literals / repeat Huffman | ✓ | ✓ |
+| Predefined / RLE / FSE / repeat sequence tables | ✓ | ✓ |
+| Repeat offsets | ✓ | ✓ |
+| Content checksum (XXH64) | ✓ | optional |
+| Frame content size / single segment | ✓ | one-shot |
+| Skippable frames, concatenated frames | ✓ | — |
+| Structured & raw dictionaries | ✓ | ✓ |
+| Streaming | ✓ | ✓ |
 
 The decoder rejects windows larger than `maxWindowSize` (64 MiB by default)
 and verifies checksums when present.
@@ -127,14 +129,14 @@ crate on 256 KiB Silesia slices at levels 3, 9 and 19, including ratios. It is
 generated and committed automatically by CI on the default branch; a missing
 series is omitted rather than faked.
 
-On the current runners, Dart AOT reaches roughly 20 MiB/s compressing English
-text at level 3, 6.5 MiB/s at level 9, and 3.4 MiB/s at level 19 (about the same
-throughput as libzstd there). Decoding runs at roughly 117 MiB/s for level 3
-and 122 MiB/s for level 19 frames. Compression ratios are close to libzstd at
-levels 3 and 9 (dickens: 0.386 vs 0.388 and 0.357 vs 0.355) and about 6%
-behind at level 19 (0.353 vs 0.332) because the high levels approximate the
-reference `btopt` parser. Native C remains faster; the chart makes the
-trade-off explicit.
+On the current runners, v0.1.2 improves the v0.1.1 numbers by roughly **1.55x**
+(AOT L3 encode), **1.85x** (L9) and **2.21x** (L19), while the decoder is about
+**1.5x** faster on AOT and **1.3–1.4x** on JS/Wasm. The checksum path was also
+optimized (native XXH64 about 2x; JS/Wasm 1.55–1.8x). Compression ratios remain
+close to libzstd at levels 3 and 9 and about 6–8% behind at level 19, because the
+high levels approximate the reference `btopt` parser. Native C remains faster;
+the chart makes the trade-off explicit, and the JS decode numbers are partly
+checksum-bound because JavaScript has no native 64-bit integers.
 
 ## Development
 
@@ -158,6 +160,6 @@ pure Dart.
 
 ## License
 
-MIT 鈥?see [LICENSE](LICENSE). Test vectors derived from the reference zstd
+MIT — see [LICENSE](LICENSE). Test vectors derived from the reference zstd
 project and the Silesia corpus are covered by [NOTICE](NOTICE).
 
