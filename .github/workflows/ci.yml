@@ -95,6 +95,7 @@ jobs:
           format: jsonl
           out: assets/benchmarks.svg
       - name: Commit the refreshed card
+        if: github.ref_type == 'branch'
         run: |
           git add assets/benchmarks.svg
           if git diff --cached --quiet; then
