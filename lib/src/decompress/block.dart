@@ -127,6 +127,11 @@ const List<int> _kLlPacked = <int>[
   2162688,
 ];
 
+/// Uint8List.setRange costs more than a byte loop for short runs on
+/// dart2js (measured ~24B crossover), while on 64-bit platforms it wins from
+/// about 8 bytes. Below this length a manual loop is used.
+const int _smallCopyLimit = kHasInt64 ? 8 : 32;
+
 /// Number of additional bits for each match length code.
 const List<int> kMatchLengthExtra = <int>[
   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, //
@@ -148,7 +153,7 @@ final class BlockLiterals {
 /// only when the window is exhausted. Kept tiny so AOT/dart2js inline it.
 @pragma('vm:prefer-inline')
 int _readBits(BitWindow window, int n) {
-  final available = 32 - window.bitsConsumed;
+  final available = window.windowBits;
   if (available >= n) {
     final value = (window.container >>> (available - n)) & kBitMasks[n];
     window.bitsConsumed += n;
@@ -198,7 +203,7 @@ final class BlockOutput {
     if (r == null) {
       final b = buffer;
       final at = position;
-      if (length <= 3) {
+      if (length < _smallCopyLimit) {
         for (var i = 0; i < length; i++) {
           b[at + i] = src[srcStart + i];
         }
@@ -264,7 +269,7 @@ final class BlockOutput {
     if (offset == 1) {
       b.fillRange(start, start + length, b[source]);
     } else if (offset >= length) {
-      if (length <= 7) {
+      if (length < _smallCopyLimit) {
         for (var i = 0; i < length; i++) {
           b[start + i] = b[source + i];
         }
@@ -809,7 +814,7 @@ void _decodeSequences(
     if (literalLength > 0) {
       if (outBuffer != null) {
         final at = output.position;
-        if (literalLength <= 3) {
+        if (literalLength < _smallCopyLimit) {
           final source = literalsStart + literalPosition;
           for (var k = 0; k < literalLength; k++) {
             outBuffer[at + k] = literalsBytes[source + k];
@@ -841,7 +846,7 @@ void _decodeSequences(
       final at = output.position;
       final source = at - offset;
       if (offset >= matchLength) {
-        if (matchLength <= 7) {
+        if (matchLength < _smallCopyLimit) {
           for (var k = 0; k < matchLength; k++) {
             outBuffer[at + k] = outBuffer[source + k];
           }

@@ -100,6 +100,17 @@ const List<int> kBitMasks = <int>[
   4294967295,
 ];
 
+/// True where `int` is a genuine 64-bit integer (VM, dart2wasm).
+///
+/// dart2js implements `int` as a double with 32-bit bitwise operators; the
+/// backward reader then has to keep a 32-bit window and split reads wider than
+/// 24 bits. On 64-bit platforms the window is 8 bytes wide, which halves the
+/// number of refills for the FSE/Huffman hot loops.
+const bool kHasInt64 = (1 << 40) == 1099511627776;
+
+/// Width of the backward-reader window in bits.
+const int kWindowBits = kHasInt64 ? 64 : 32;
+
 /// Index of the highest set bit of [value] (`value > 0`).
 int highestSetBit(int value) {
   var v = value;
@@ -258,14 +269,15 @@ final class BackwardBitReader {
         'last back-reference bit stream byte is zero',
       );
     }
-    // The window covers the last (up to) four bytes of the stream; bytes past
-    // `end` read as zero, which gives the same padding as libzstd.
-    var windowStart = end - 4;
+    // The window covers the last (up to) 8 bytes of the stream on 64-bit
+    // platforms (4 on dart2js); bytes past `end` read as zero, which gives the
+    // same padding as libzstd.
+    var windowStart = end - (kHasInt64 ? 8 : 4);
     if (windowStart < start) windowStart = start;
     _ptr = windowStart;
     _container = _loadContainer(windowStart);
     final inWindow = (end - windowStart - 1) * 8 + highestSetBit(lastByte);
-    _bitsConsumed = 32 - inWindow;
+    _bitsConsumed = kWindowBits - inWindow;
   }
 
   final Uint8List data;
@@ -277,10 +289,10 @@ final class BackwardBitReader {
   int _bitsConsumed = 0;
 
   /// Number of unread bits (may be negative for truncated streams).
-  int get bitPosition => (_ptr - start) * 8 + 32 - _bitsConsumed;
+  int get bitPosition => (_ptr - start) * 8 + kWindowBits - _bitsConsumed;
 
   /// Bits currently available in the window without a refill.
-  int get windowBits => 32 - _bitsConsumed;
+  int get windowBits => kWindowBits - _bitsConsumed;
 
   /// Window state accessors used by [BitWindow] (which copies the fields into
   /// locals for the hot loops).
@@ -295,6 +307,19 @@ final class BackwardBitReader {
   }
 
   int _loadContainer(int windowStart) {
+    if (kHasInt64) {
+      final b0 = windowStart < end ? data[windowStart] : 0;
+      final b1 = windowStart + 1 < end ? data[windowStart + 1] : 0;
+      final b2 = windowStart + 2 < end ? data[windowStart + 2] : 0;
+      final b3 = windowStart + 3 < end ? data[windowStart + 3] : 0;
+      final b4 = windowStart + 4 < end ? data[windowStart + 4] : 0;
+      final b5 = windowStart + 5 < end ? data[windowStart + 5] : 0;
+      final b6 = windowStart + 6 < end ? data[windowStart + 6] : 0;
+      final b7 = windowStart + 7 < end ? data[windowStart + 7] : 0;
+      final lo = b0 + (b1 << 8) + (b2 << 16) + b3 * 16777216;
+      final hi = b4 + (b5 << 8) + (b6 << 16) + b7 * 16777216;
+      return lo + hi * 4294967296;
+    }
     final b0 = windowStart < end ? data[windowStart] : 0;
     final b1 = windowStart + 1 < end ? data[windowStart + 1] : 0;
     final b2 = windowStart + 2 < end ? data[windowStart + 2] : 0;
@@ -322,17 +347,17 @@ final class BackwardBitReader {
         'invalid back-reference bit count',
       );
     }
-    if (n > 24) {
+    if (!kHasInt64 && n > 24) {
       // A 32-bit window guarantees 25 bits after a refill; longer fields are
       // read as a high part plus an 8-bit low part (same bit order).
       final high = readBits(n - 8);
       final low = readBits(8);
       return high * 256 + low;
     }
-    var available = 32 - _bitsConsumed;
+    var available = kWindowBits - _bitsConsumed;
     if (available < n) {
       _refill();
-      available = 32 - _bitsConsumed;
+      available = kWindowBits - _bitsConsumed;
     }
     if (available < n) {
       // Reading past the start: the low-order bits are zero-extended, the
@@ -342,7 +367,8 @@ final class BackwardBitReader {
       _bitsConsumed += n;
       return value * kPow2[n - have];
     }
-    final value = (_container >>> (32 - _bitsConsumed - n)) & kBitMasks[n];
+    final value =
+        (_container >>> (kWindowBits - _bitsConsumed - n)) & kBitMasks[n];
     _bitsConsumed += n;
     return value;
   }
@@ -367,9 +393,9 @@ final class BitWindow {
   int bitsConsumed;
 
   /// Number of unread bits; may be negative for truncated streams.
-  int get bitPosition => (ptr - reader.start) * 8 + 32 - bitsConsumed;
+  int get bitPosition => (ptr - reader.start) * 8 + kWindowBits - bitsConsumed;
 
-  int get windowBits => 32 - bitsConsumed;
+  int get windowBits => kWindowBits - bitsConsumed;
 
   /// Writes the window state back to the owning reader.
   void flush() {
@@ -379,14 +405,15 @@ final class BitWindow {
   @pragma('vm:prefer-inline')
   int readBits(int n) {
     if (n == 0) return 0;
-    if (32 - bitsConsumed < n) return _slowReadBits(n);
-    final value = (container >>> (32 - bitsConsumed - n)) & kBitMasks[n];
+    if (kWindowBits - bitsConsumed < n) return _slowReadBits(n);
+    final value =
+        (container >>> (kWindowBits - bitsConsumed - n)) & kBitMasks[n];
     bitsConsumed += n;
     return value;
   }
 
   int _slowReadBits(int n) {
-    if (n > 24) {
+    if (!kHasInt64 && n > 24) {
       final high = readBits(n - 8);
       final low = readBits(8);
       return high * 256 + low;
@@ -403,15 +430,16 @@ final class BitWindow {
         container = reader._loadContainer(ptr);
       }
     }
-    if (32 - bitsConsumed < n) {
+    if (kWindowBits - bitsConsumed < n) {
       // End of stream: low-order bits are zero-extended.
-      final have = 32 - bitsConsumed;
+      final have = kWindowBits - bitsConsumed;
       final present = have < 0 ? 0 : have;
       final value = present == 0 ? 0 : (container & kBitMasks[present]);
       bitsConsumed += n;
       return value * kPow2[n - present];
     }
-    final value = (container >>> (32 - bitsConsumed - n)) & kBitMasks[n];
+    final value =
+        (container >>> (kWindowBits - bitsConsumed - n)) & kBitMasks[n];
     bitsConsumed += n;
     return value;
   }

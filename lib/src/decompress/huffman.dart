@@ -329,7 +329,7 @@ final class HuffmanTable {
     final maxBits = table.maxBits;
     int state;
     {
-      final available = 32 - window.bitsConsumed;
+      final available = window.windowBits;
       if (available >= maxBits) {
         state =
             (window.container >>> (available - maxBits)) & kBitMasks[maxBits];
@@ -341,7 +341,7 @@ final class HuffmanTable {
     for (var i = 0; i < length; i++) {
       final entry = entries[state];
       final nb = entry >> 8;
-      final available = 32 - window.bitsConsumed;
+      final available = window.windowBits;
       int rest;
       if (available >= nb) {
         rest = (window.container >>> (available - nb)) & kBitMasks[nb];

@@ -12,7 +12,7 @@ A from-scratch, **pure Dart** implementation of the
 > **Status: v0.1.2 (production).** Format conformance is verified against the
 > official zstd `decodecorpus` corpus, and the v0.1.2 performance phase improved
 > the AOT encoder by roughly 1.55x/1.85x/2.21x at levels 3/9/19 and the AOT
-> decoder by roughly 1.5x, with smaller but real JS/Wasm gains.
+> decoder by roughly 1.3–1.5x, with larger JS/Wasm gains.
 > The encoder covers levels 1–19 with Huffman literals (1/4 streams, treeless
 > repeat), custom FSE sequence tables, repeat/RLE modes and raw/formatted
 > dictionary support. Levels 10–19 use a deeper-search lazy2 parser rather than
@@ -131,7 +131,7 @@ series is omitted rather than faked.
 
 On the current runners, v0.1.2 improves the v0.1.1 numbers by roughly **1.55x**
 (AOT L3 encode), **1.85x** (L9) and **2.21x** (L19), while the decoder is about
-**1.5x** faster on AOT and **1.3–1.4x** on JS/Wasm. The checksum path was also
+**1.3–1.5x** faster on AOT, **1.9x** on JS and **1.47x** on Wasm. The checksum path was also
 optimized (native XXH64 about 2x; JS/Wasm 1.55–1.8x). Compression ratios remain
 close to libzstd at levels 3 and 9 and about 6–8% behind at level 19, because the
 high levels approximate the reference `btopt` parser. Native C remains faster;

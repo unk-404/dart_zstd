@@ -13,8 +13,8 @@
 ### Performance
 - Encoder (Dart AOT, Silesia slices): ~1.55x at L3, ~1.85x at L9 and ~2.21x
   at L19; ratio cost +0.70% / +0.49% / +0.09%.
-- Decoder: ~1.48x/1.51x AOT at L3/L19, ~1.33x/1.40x on dart2js and
-  ~1.30x/1.34x on dart2wasm. The JS decode path is partly checksum-bound.
+- Decoder: ~1.3–1.5x AOT at L3/L19, ~1.90x/1.90x on dart2js and
+  ~1.47x/1.48x on dart2wasm. The JS decode path is partly checksum-bound.
 - XXH64: ~2x native, ~1.55x JS, ~1.81x dart2wasm.
 - Rewrote match finding (word-based hash, closure-free lazy/lazy2, cheap
   candidate rejection), bit/sequence writing, Huffman package-merge and the
