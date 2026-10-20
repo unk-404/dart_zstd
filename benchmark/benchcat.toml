@@ -7,9 +7,6 @@
 #
 # Inputs are repository-relative.
 
-[font]
-family = "mplus-rounded"
-
 [render]
 title = "zstd_neo vs zstd-rs"
 subtitle = "{platform} · commit {commit:short}"
