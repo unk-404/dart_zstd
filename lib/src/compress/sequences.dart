@@ -1,3 +1,4 @@
+import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'bit_writer.dart';
@@ -129,6 +130,17 @@ final FseCTable _ofTable = FseCTable.fromNormalized(
   5,
 );
 
+/// Compression mode values from the sequences section header.
+const int sequenceModePredefined = 0;
+const int sequenceModeRle = 1;
+const int sequenceModeFse = 2;
+const int sequenceModeRepeat = 3;
+
+/// Highest code representable by each predefined table.
+const int _defaultMaxLlSymbol = 35;
+const int _defaultMaxMlSymbol = 52;
+const int _defaultMaxOfSymbol = 28;
+
 /// Literals length code for [length] (0..131071).
 int literalsLengthCode(int length) {
   if (length < 64) return _llCodeTable[length];
@@ -217,15 +229,62 @@ final class RepeatOffsetHistory {
   }
 }
 
+/// One selected entropy-table choice for one symbol type.
+final class SequenceTableChoice {
+  SequenceTableChoice({
+    required this.mode,
+    required this.table,
+    this.normalized,
+    this.tableLog = 0,
+    this.maxSymbol = 0,
+    this.rleSymbol = 0,
+    this.ncount,
+  });
+
+  final int mode;
+  final FseCTable table;
+  final List<int>? normalized;
+  final int tableLog;
+  final int maxSymbol;
+  final int rleSymbol;
+  final Uint8List? ncount;
+
+  SequenceTableChoice repeated() => SequenceTableChoice(
+    mode: sequenceModeRepeat,
+    table: table,
+    normalized: normalized,
+    tableLog: tableLog,
+    maxSymbol: maxSymbol,
+  );
+
+  bool get repeatable => mode == sequenceModeFse || mode == sequenceModeRepeat;
+}
+
+/// Snapshot of the per-symbol-type table state, for block fallbacks.
+final class SequenceTableSnapshot {
+  SequenceTableSnapshot(this._ll, this._of, this._ml);
+
+  final SequenceTableChoice? _ll;
+  final SequenceTableChoice? _of;
+  final SequenceTableChoice? _ml;
+}
+
 /// Encodes the sequences section for one compressed block.
 ///
-/// The repeat-offset history is kept across the compressed blocks of a frame,
-/// as required by the format. Raw and RLE blocks do not update it, so callers
-/// must snapshot it before a block and restore it if the block falls back to a
-/// raw representation.
+/// The repeat-offset history and the previously used entropy tables are kept
+/// across the compressed blocks of a frame, as required by the format.
 final class SequenceWriter {
   /// Repeat-offset history shared across the blocks of a frame.
-  final RepeatOffsetHistory history = RepeatOffsetHistory();
+  final RepeatOffsetHistory history;
+
+  SequenceTableChoice? _llPrevious;
+  SequenceTableChoice? _ofPrevious;
+  SequenceTableChoice? _mlPrevious;
+
+  SequenceWriter({List<int>? initialRepCodes})
+    : history = RepeatOffsetHistory() {
+    if (initialRepCodes != null) history.restore(initialRepCodes);
+  }
 
   /// Captures the repeat-offset history.
   List<int> snapshotRepCodes() => history.snapshot();
@@ -233,12 +292,21 @@ final class SequenceWriter {
   /// Restores a history previously returned by [snapshotRepCodes].
   void restoreRepCodes(List<int> snapshot) => history.restore(snapshot);
 
+  /// Captures the per-type entropy tables.
+  SequenceTableSnapshot snapshotTables() =>
+      SequenceTableSnapshot(_llPrevious, _ofPrevious, _mlPrevious);
+
+  /// Restores per-type entropy tables.
+  void restoreTables(SequenceTableSnapshot snapshot) {
+    _llPrevious = snapshot._ll;
+    _ofPrevious = snapshot._of;
+    _mlPrevious = snapshot._ml;
+  }
+
   /// Writes the complete sequences section (header + bitstream) for [store].
   void write(ByteWriter output, SequenceStore store) {
     _writeNumberOfSequences(output, store.count);
     if (store.count == 0) return;
-    // All three symbol types use their predefined distributions.
-    output.writeByte(0);
 
     final count = store.count;
     final llCodes = Int32List(count);
@@ -256,14 +324,56 @@ final class SequenceWriter {
       ofCodes[i] = _highBit32(offsetValue);
     }
 
-    final bitWriter = BitWriter(output);
+    final llChoice = _select(
+      codes: llCodes,
+      nbSeq: count,
+      maxLog: 9,
+      maxSymbolAllowed: _defaultMaxLlSymbol,
+      defaultNormalized: _llDefaultDistribution,
+      defaultTableLog: 6,
+      defaultMaxSymbol: _defaultMaxLlSymbol,
+      previous: _llPrevious,
+      defaultTable: _llTable,
+    );
+    final ofChoice = _select(
+      codes: ofCodes,
+      nbSeq: count,
+      maxLog: 8,
+      maxSymbolAllowed: 31,
+      defaultNormalized: _ofDefaultDistribution,
+      defaultTableLog: 5,
+      defaultMaxSymbol: _defaultMaxOfSymbol,
+      previous: _ofPrevious,
+      defaultTable: _ofTable,
+    );
+    final mlChoice = _select(
+      codes: mlCodes,
+      nbSeq: count,
+      maxLog: 9,
+      maxSymbolAllowed: _defaultMaxMlSymbol,
+      defaultNormalized: _mlDefaultDistribution,
+      defaultTableLog: 6,
+      defaultMaxSymbol: _defaultMaxMlSymbol,
+      previous: _mlPrevious,
+      defaultTable: _mlTable,
+    );
 
-    // The last sequence is encoded first. Its symbol states are pre-loaded so
-    // that no state-transition bits are needed for it.
+    output.writeByte(
+      (llChoice.mode << 6) | (ofChoice.mode << 4) | (mlChoice.mode << 2),
+    );
+    _writeChoiceTable(output, llChoice);
+    _writeChoiceTable(output, ofChoice);
+    _writeChoiceTable(output, mlChoice);
+
+    _llPrevious = llChoice.repeatable ? llChoice : null;
+    _ofPrevious = ofChoice.repeatable ? ofChoice : null;
+    _mlPrevious = mlChoice.repeatable ? mlChoice : null;
+
+    final bitWriter = BitWriter(output);
     final last = count - 1;
-    var llState = _llTable.initStateForSymbol(llCodes[last]);
-    var ofState = _ofTable.initStateForSymbol(ofCodes[last]);
-    var mlState = _mlTable.initStateForSymbol(mlCodes[last]);
+    var llState = llChoice.table.initStateForSymbol(llCodes[last]);
+    var ofState = ofChoice.table.initStateForSymbol(ofCodes[last]);
+    var mlState = mlChoice.table.initStateForSymbol(mlCodes[last]);
     _addExtraBits(
       bitWriter,
       store.litLengths[last],
@@ -275,9 +385,9 @@ final class SequenceWriter {
     );
 
     for (var i = last - 1; i >= 0; i--) {
-      ofState = _ofTable.encodeSymbol(bitWriter, ofState, ofCodes[i]);
-      mlState = _mlTable.encodeSymbol(bitWriter, mlState, mlCodes[i]);
-      llState = _llTable.encodeSymbol(bitWriter, llState, llCodes[i]);
+      ofState = ofChoice.table.encodeSymbol(bitWriter, ofState, ofCodes[i]);
+      mlState = mlChoice.table.encodeSymbol(bitWriter, mlState, mlCodes[i]);
+      llState = llChoice.table.encodeSymbol(bitWriter, llState, llCodes[i]);
       _addExtraBits(
         bitWriter,
         store.litLengths[i],
@@ -290,10 +400,166 @@ final class SequenceWriter {
     }
 
     // Flushed in decoder-read order: match lengths, offsets, literals lengths.
-    _mlTable.flushState(bitWriter, mlState);
-    _ofTable.flushState(bitWriter, ofState);
-    _llTable.flushState(bitWriter, llState);
+    mlChoice.table.flushState(bitWriter, mlState);
+    ofChoice.table.flushState(bitWriter, ofState);
+    llChoice.table.flushState(bitWriter, llState);
     bitWriter.finish();
+  }
+
+  void _writeChoiceTable(ByteWriter output, SequenceTableChoice choice) {
+    if (choice.mode == sequenceModeFse) {
+      output.writeBytes(choice.ncount!);
+    } else if (choice.mode == sequenceModeRle) {
+      output.writeByte(choice.rleSymbol);
+    }
+  }
+
+  SequenceTableChoice _select({
+    required Int32List codes,
+    required int nbSeq,
+    required int maxLog,
+    required int maxSymbolAllowed,
+    required List<int> defaultNormalized,
+    required int defaultTableLog,
+    required int defaultMaxSymbol,
+    required SequenceTableChoice? previous,
+    required FseCTable defaultTable,
+  }) {
+    final counts = Int32List(maxSymbolAllowed + 1);
+    var maxPresent = -1;
+    var mostFrequent = 0;
+    for (var i = 0; i < nbSeq; i++) {
+      final code = codes[i];
+      if (code < 0 || code > maxSymbolAllowed) {
+        throw StateError('sequence code $code out of range');
+      }
+      final c = ++counts[code];
+      if (c > mostFrequent) mostFrequent = c;
+      if (code > maxPresent) maxPresent = code;
+    }
+    final basicAllowed = maxPresent <= defaultMaxSymbol;
+
+    if (mostFrequent == nbSeq) {
+      if (basicAllowed && nbSeq <= 2) {
+        return SequenceTableChoice(
+          mode: sequenceModePredefined,
+          table: defaultTable,
+          normalized: defaultNormalized,
+          tableLog: defaultTableLog,
+          maxSymbol: maxPresent,
+        );
+      }
+      return SequenceTableChoice(
+        mode: sequenceModeRle,
+        table: FseCTable.rle(maxPresent),
+        maxSymbol: maxPresent,
+        rleSymbol: maxPresent,
+      );
+    }
+
+    SequenceTableChoice? best;
+    var bestCost = double.infinity;
+    if (basicAllowed) {
+      best = SequenceTableChoice(
+        mode: sequenceModePredefined,
+        table: defaultTable,
+        normalized: defaultNormalized,
+        tableLog: defaultTableLog,
+        maxSymbol: maxPresent,
+      );
+      bestCost = _entropyBits(
+        defaultNormalized,
+        defaultMaxSymbol,
+        defaultTableLog,
+        counts,
+      );
+    }
+
+    if (previous != null &&
+        previous.normalized != null &&
+        previous.repeatable &&
+        _canRepresent(previous.normalized!, counts, maxSymbolAllowed)) {
+      final repeatCost = _entropyBits(
+        previous.normalized!,
+        previous.maxSymbol,
+        previous.tableLog,
+        counts,
+      );
+      if (repeatCost < bestCost) {
+        best = previous.repeated();
+        bestCost = repeatCost;
+      }
+    }
+
+    try {
+      final tableLog = fseOptimalTableLog(maxLog, nbSeq, maxPresent, 2);
+      final normalized = fseNormalizeCounts(
+        count: counts,
+        maxSymbolValue: maxPresent,
+        total: nbSeq,
+        tableLog: tableLog,
+      );
+      final ncountWriter = ByteWriter(64);
+      writeFseNCount(ncountWriter, normalized, maxPresent, tableLog);
+      final ncount = ncountWriter.takeBytes();
+      final customCost =
+          ncount.length * 8 +
+          _entropyBits(normalized, maxPresent, tableLog, counts);
+      if (customCost < bestCost) {
+        best = SequenceTableChoice(
+          mode: sequenceModeFse,
+          table: FseCTable.fromNormalized(normalized, maxPresent, tableLog),
+          normalized: normalized,
+          tableLog: tableLog,
+          maxSymbol: maxPresent,
+          ncount: ncount,
+        );
+        bestCost = customCost;
+      }
+    } on ArgumentError {
+      // Normalization impossible; keep the predefined table.
+    } on StateError {
+      // Normalization impossible; keep the predefined table.
+    }
+
+    if (best == null) {
+      // Should only happen when the alphabet is larger than the predefined
+      // table; normalization is then guaranteed to have succeeded above.
+      throw StateError('no sequence entropy table could be selected');
+    }
+    return best;
+  }
+
+  static bool _canRepresent(
+    List<int> normalized,
+    Int32List counts,
+    int maxSymbolAllowed,
+  ) {
+    for (var s = 0; s <= maxSymbolAllowed; s++) {
+      if (counts[s] != 0) {
+        if (s >= normalized.length || normalized[s] == 0) return false;
+      }
+    }
+    return true;
+  }
+
+  static double _entropyBits(
+    List<int> normalized,
+    int maxSymbol,
+    int tableLog,
+    Int32List counts,
+  ) {
+    var bits = 0.0;
+    for (var s = 0; s <= maxSymbol && s < counts.length; s++) {
+      final c = counts[s];
+      if (c == 0) continue;
+      if (s >= normalized.length) return double.infinity;
+      var probability = normalized[s];
+      if (probability == 0) return double.infinity;
+      if (probability == -1) probability = 1;
+      bits += c * (tableLog - math.log(probability) / math.ln2);
+    }
+    return bits;
   }
 
   void _addExtraBits(

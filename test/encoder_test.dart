@@ -356,8 +356,10 @@ _parseHeader(Uint8List frame) {
   int? contentSize;
   if (fcsSize > 0) {
     var value = 0;
+    var multiplier = 1;
     for (var i = 0; i < fcsSize; i++) {
-      value |= frame[position + i] << (8 * i);
+      value += frame[position + i] * multiplier;
+      multiplier *= 256;
     }
     if (fcsSize == 2) value += 256;
     contentSize = value;

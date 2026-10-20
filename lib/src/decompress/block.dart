@@ -121,6 +121,24 @@ final class ContiguousBlockOutput implements BlockOutput {
       }
       if (offset >= length) {
         buffer.setRange(position, position + length, buffer, source);
+      } else if (length >= 192) {
+        // Overlapping copy. First copy the pattern (at most `offset` bytes),
+        // then repeatedly double it. Every setRange source range ends at or
+        // before its destination range starts, so no copy overlaps itself.
+        var copied = offset < length ? offset : length;
+        buffer.setRange(position, position + copied, buffer, source);
+        while (copied < length) {
+          var next = copied;
+          final remaining = length - copied;
+          if (next > remaining) next = remaining;
+          buffer.setRange(
+            position + copied,
+            position + copied + next,
+            buffer,
+            position,
+          );
+          copied += next;
+        }
       } else {
         for (var i = 0; i < length; i++) {
           buffer[position + i] = buffer[source + i];
@@ -568,11 +586,20 @@ void _decodeSequences(
   final literalsStart = literals.start;
   final literalsLength = literals.length;
   final repetitions = context.repOffsets;
+  final llEntries = llTable.entries;
+  final llBase = llTable.stateBase;
+  final ofEntries = ofTable.entries;
+  final ofBase = ofTable.stateBase;
+  final mlEntries = mlTable.entries;
+  final mlBase = mlTable.stateBase;
 
   for (var i = 0; i < numberOfSequences; i++) {
-    final ofCode = ofTable.symbols[ofState];
-    final llCode = llTable.symbols[llState];
-    final mlCode = mlTable.symbols[mlState];
+    final ofEntry = ofEntries[ofState];
+    final llEntry = llEntries[llState];
+    final mlEntry = mlEntries[mlState];
+    final ofCode = ofEntry & 0xFF;
+    final llCode = llEntry & 0xFF;
+    final mlCode = mlEntry & 0xFF;
     if (llCode > kMaxLlCode || mlCode > kMaxMlCode || ofCode > kMaxOffsetCode) {
       throw const ZstdException(
         ZstdErrorCode.invalidSequence,
@@ -620,12 +647,9 @@ void _decodeSequences(
     output.copyMatch(offset, matchLength);
 
     if (i != numberOfSequences - 1) {
-      final llBits = llTable.numBits[llState];
-      llState = llTable.stateBase[llState] + bits.readBits(llBits);
-      final mlBits = mlTable.numBits[mlState];
-      mlState = mlTable.stateBase[mlState] + bits.readBits(mlBits);
-      final ofBits = ofTable.numBits[ofState];
-      ofState = ofTable.stateBase[ofState] + bits.readBits(ofBits);
+      llState = llBase[llState] + bits.readBits(llEntry >> 8);
+      mlState = mlBase[mlState] + bits.readBits(mlEntry >> 8);
+      ofState = ofBase[ofState] + bits.readBits(ofEntry >> 8);
     }
   }
 

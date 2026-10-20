@@ -47,6 +47,22 @@ jobs:
       - name: dart2wasm
         run: dart test -p chrome -c dart2wasm
 
+  interop:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: stable
+      - uses: dtolnay/rust-toolchain@stable
+      - run: dart pub get
+      - name: Build reference zstd
+        run: cargo build --release --manifest-path benchmark/rust_ref/Cargo.toml
+      - name: Interop and differential tests
+        env:
+          ZSTD_REF: ${{ github.workspace }}/benchmark/rust_ref/target/release/zstd_ref
+        run: dart test test/interop_test.dart test/differential_test.dart
+
   benchmark:
     # TEST must be green first; the chart is only committed from the default
     # branch (or a manual run), never from a pull request.
@@ -54,7 +70,7 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'push' &&
        (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main'))
-    needs: [analyze, test, web]
+    needs: [analyze, test, web, interop]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:

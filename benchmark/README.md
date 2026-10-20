@@ -36,7 +36,7 @@ dart format benchmark/bench_data.g.dart
 ## Pipeline
 
 ```sh
-# libzstd reference (canonical JSONL, 4 corpora x 4 metrics)
+# libzstd reference (canonical JSONL, 4 corpora x 8 metrics)
 cargo run --release --manifest-path benchmark/rust_ref/Cargo.toml -- bench
 
 # Dart VM/AOT benchmark_test JSONL
@@ -70,13 +70,19 @@ enforces the exact id set for each series.
 Each canonical line is one benchmark record:
 
 ```json
-{"id":"compress.dickens.l3","group":"Compress","label":"dickens","unit":"MiB/s","value":41.982275,"stats":{"rme_pct":1.4238,"samples":85}}
-{"id":"ratio.dickens.l3","group":"Ratio · L3","label":"dickens","unit":"x","direction":"lower","value":0.539078,"stats":{"rme_pct":0.0,"samples":1}}
+{"id":"compress.dickens.l9","group":"Compress · L9","label":"dickens","unit":"MiB/s","value":6.473736,"stats":{"rme_pct":2.1772,"samples":100}}
+{"id":"ratio.dickens.l19","group":"Ratio · L19","label":"dickens","unit":"x","direction":"lower","value":0.352791,"stats":{"rme_pct":0.0,"samples":1}}
 ```
 
-* `compress.<corpus>.l3` — MiB/s of plaintext;
-* `decompress.<corpus>.l3` / `.l19` — MiB/s of decompressed plaintext;
-* `ratio.<corpus>.l3` — compressed/original, lower is better; AOT only.
+* `compress.<corpus>.l3` / `.l9` / `.l19` — MiB/s of plaintext;
+* `decompress.<corpus>.l3` / `.l19` — MiB/s of decompressed plaintext, from
+  the committed L3/L19 frames;
+* `ratio.<corpus>.l3` / `.l9` / `.l19` — compressed/original, lower is
+  better; AOT only.
+
+That is 20 throughput rows plus 12 ratio rows (32) for the AOT and Rust
+series, and 20 rows for each Web series. L9 frames are not committed: the L9
+ratio is measured by compressing in `bench` and in `report.dart` instead.
 
 The Rust harness runs three warm-up iterations, then repetitions until at least
 300 ms elapsed or 200 repetitions; `stats.rme_pct` is the approximate 95%
@@ -85,7 +91,8 @@ relative margin of error. `benchmark_test` runs with `minDuration` 500 ms,
 
 ## Chart
 
-[`benchcat.toml`](benchcat.toml) defines one card with four series. Groups come
-from each record's `group` field; missing series are skipped. CI renders
-`assets/benchmarks.svg` from the four canonical files and commits it from the
-default branch.
+[`benchcat.toml`](benchcat.toml) defines one card with four series and eight
+groups (three compression levels, two decompression levels, three ratio
+levels). Groups come from each record's `group` field; missing series are
+skipped. CI renders `assets/benchmarks.svg` from the four canonical files and
+commits it from the default branch.

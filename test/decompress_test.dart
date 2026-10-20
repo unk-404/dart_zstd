@@ -21,6 +21,8 @@ Uint8List _fixtureZst(String name) => _b64(_fixture(name).zstBase64);
 
 Uint8List _fixtureBin(String name) => _b64(_fixture(name).binBase64);
 
+Uint8List _fixtureDict(String name) => _b64(_fixture(name).dictBase64!);
+
 /// Little-endian 32-bit value (used to build and corrupt test frames).
 List<int> _le32(int value) => <int>[
   value & 0xFF,
@@ -349,6 +351,106 @@ void main() {
       expect(
         const ZstdDecoder().convert(asList),
         _fixtureBin('text_4k_nochecksum'),
+      );
+    });
+  });
+
+  group('maxOutputSize', () {
+    test('unlimited by default', () {
+      expect(
+        const ZstdDecoder().decompress(_fixtureZst('text_16k_l3')),
+        _fixtureBin('text_16k_l3'),
+      );
+    });
+
+    test('exact bound is allowed', () {
+      final expected = _fixtureBin('text_16k_l3');
+      expect(
+        ZstdDecoder(maxOutputSize: expected.length)
+            .decompress(_fixtureZst('text_16k_l3')),
+        expected,
+      );
+    });
+
+    test('one byte below the output size throws outputTooLarge', () {
+      final expected = _fixtureBin('text_16k_l3');
+      _expectZstdException(
+        () =>
+            ZstdDecoder(maxOutputSize: expected.length - 1)
+                .decompress(_fixtureZst('text_16k_l3')),
+        code: ZstdErrorCode.outputTooLarge,
+      );
+    });
+
+    test('zero bound allows an empty frame but rejects output', () {
+      expect(
+        const ZstdDecoder(maxOutputSize: 0)
+            .decompress(_fixtureZst('golden_empty_block')),
+        isEmpty,
+      );
+      _expectZstdException(
+        () =>
+            const ZstdDecoder(maxOutputSize: 0)
+                .decompress(_fixtureZst('text_4k_nochecksum')),
+        code: ZstdErrorCode.outputTooLarge,
+      );
+    });
+
+    test('bound covers concatenated frames', () {
+      final frame = _fixtureZst('multiframe');
+      final expected = _fixtureBin('multiframe');
+      expect(
+        ZstdDecoder(maxOutputSize: expected.length).decompress(frame),
+        expected,
+      );
+      _expectZstdException(
+        () => ZstdDecoder(maxOutputSize: expected.length - 1).decompress(frame),
+        code: ZstdErrorCode.outputTooLarge,
+      );
+    });
+
+    test('skippable frames do not consume the bound', () {
+      final expected = _fixtureBin('skippable_between');
+      expect(
+        ZstdDecoder(maxOutputSize: expected.length)
+            .decompress(_fixtureZst('skippable_between')),
+        expected,
+      );
+      _expectZstdException(
+        () =>
+            ZstdDecoder(maxOutputSize: expected.length - 1)
+                .decompress(_fixtureZst('skippable_between')),
+        code: ZstdErrorCode.outputTooLarge,
+      );
+    });
+
+    test('dictionary frames honour the bound', () {
+      final expected = _fixtureBin('structdict');
+      expect(
+        ZstdDecoder(
+          dictionary: _fixtureDict('structdict'),
+          maxOutputSize: expected.length,
+        ).decompress(_fixtureZst('structdict')),
+        expected,
+      );
+      _expectZstdException(
+        () => ZstdDecoder(
+          dictionary: _fixtureDict('structdict'),
+          maxOutputSize: expected.length - 1,
+        ).decompress(_fixtureZst('structdict')),
+        code: ZstdErrorCode.outputTooLarge,
+      );
+    });
+
+    test('large RLE output respects the bound', () {
+      final frame = _rleFrame(1000, 0x41);
+      expect(
+        const ZstdDecoder(maxOutputSize: 1000).decompress(frame),
+        hasLength(1000),
+      );
+      _expectZstdException(
+        () => const ZstdDecoder(maxOutputSize: 999).decompress(frame),
+        code: ZstdErrorCode.outputTooLarge,
       );
     });
   });

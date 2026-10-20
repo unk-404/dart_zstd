@@ -9,11 +9,12 @@ A from-scratch, **pure Dart** implementation of the
 - Streaming encoder with `Converter` / `startChunkedConversion`, plus a
   one-shot fast path.
 
-> **Status: v0.1.0.** The decoder targets the full format. The encoder
-> implements levels 1–3 with fast/double-fast match finding, raw/RLE literals
-> and the predefined FSE sequence tables; Huffman literal coding, custom FSE
-> tables, repeat modes and levels 4–19 are on the roadmap. Expect the encoder
-> to trade compression ratio for a small, auditable code base until then.
+> **Status: v0.1.1 (production).** The decoder covers the full Zstandard
+> format. The encoder now covers levels 1–19 with Huffman literals (1/4 streams,
+> treeless repeat), custom FSE sequence tables, repeat/RLE modes and
+> raw/formatted dictionary support. Levels 10–19 use a deeper-search lazy2
+> parser rather than the reference `btopt`, so they produce valid frames and
+> competitive ratios but may trail libzstd at the very highest levels.
 
 ## Usage
 
@@ -66,12 +67,23 @@ final restored = codec.decompressBytes(compressed);
 ### Dictionaries
 
 ```dart
-final decoder = ZstdDecoder(dictionary: dictionaryBytes);
-final data = decoder.decompress(frameWithDictionary);
+final codec = ZstdCodec(level: 9, dictionary: dictionaryBytes);
+final frame = codec.encode(payload);
+final data = codec.decode(frame);
 ```
 
 Raw-content dictionaries and formatted zstd dictionaries
-(magic `0xEC30A437`) are both supported for decoding.
+(magic `0xEC30A437`, including its dictionary id) are supported by both the
+encoder and the decoder.
+
+### Output limits
+
+```dart
+final decoder = ZstdDecoder(maxOutputSize: 64 << 20); // 64 MiB
+```
+
+The default is unlimited; production services receiving untrusted input should
+set `maxOutputSize` (and optionally a smaller `maxWindowSize`).
 
 ## Format support
 
@@ -79,14 +91,14 @@ Raw-content dictionaries and formatted zstd dictionaries
 | --- | :---: | :---: |
 | Raw / RLE / compressed blocks | ✓ | ✓ |
 | Raw / RLE literals | ✓ | ✓ |
-| Huffman literals, 1 & 4 streams | ✓ | — |
-| Treeless literals / repeat Huffman | ✓ | — |
-| Predefined / RLE / FSE / repeat sequence tables | ✓ | predefined only |
+| Huffman literals, 1 & 4 streams | ✓ | ✓ |
+| Treeless literals / repeat Huffman | ✓ | ✓ |
+| Predefined / RLE / FSE / repeat sequence tables | ✓ | ✓ |
 | Repeat offsets | ✓ | ✓ |
 | Content checksum (XXH64) | ✓ | optional |
 | Frame content size / single segment | ✓ | one-shot |
 | Skippable frames, concatenated frames | ✓ | — |
-| Structured & raw dictionaries | ✓ | — |
+| Structured & raw dictionaries | ✓ | ✓ |
 | Streaming | ✓ | ✓ |
 
 The decoder rejects windows larger than `maxWindowSize` (64 MiB by default)
@@ -96,15 +108,19 @@ and verifies checksums when present.
 
 ![zstd_neo benchmarks](https://raw.githubusercontent.com/unk-404/dart_zstd/HEAD/assets/benchmarks.svg)
 
-The card is rendered from `benchmark_test` timings (Dart AOT, JS and Wasm)
-against the Rust `zstd` crate on 256 KiB Silesia slices. It is generated and
-committed automatically by CI on the default branch; a missing series is
-omitted rather than faked.
+The card compares Dart AOT, dart2js, dart2wasm and the native Rust `zstd`
+crate on 256 KiB Silesia slices at levels 3, 9 and 19, including ratios. It is
+generated and committed automatically by CI on the default branch; a missing
+series is omitted rather than faked.
 
-The decoder currently reaches roughly 130 MiB/s on 64 KiB of English text
-(compressed, one-shot, JIT), 241 MiB/s on level-19 text, and 684 MiB/s on the
-1 MiB RLE golden vector. The v0.1.0 encoder trades ratio for simplicity; the
-remaining gap is mostly Huffman literal coding (v0.2).
+On the current runners, Dart AOT reaches roughly 20 MiB/s compressing English
+text at level 3, 6.5 MiB/s at level 9, and 3.4 MiB/s at level 19 (about the same
+throughput as libzstd there). Decoding runs at roughly 117 MiB/s for level 3
+and 122 MiB/s for level 19 frames. Compression ratios are close to libzstd at
+levels 3 and 9 (dickens: 0.386 vs 0.388 and 0.357 vs 0.355) and about 6%
+behind at level 19 (0.353 vs 0.332) because the high levels approximate the
+reference `btopt` parser. Native C remains faster; the chart makes the
+trade-off explicit.
 
 ## Development
 

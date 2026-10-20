@@ -48,13 +48,49 @@ void main() {
       expect(restored.toUint8List(), input.toUint8List());
     });
 
-    test('encoder rejects unavailable levels', () {
+    test('level 19 roundtrip', () {
+      final input = utf8.encode('high compression level ' * 2000);
+      final codec = const ZstdCodec(level: 19);
+      expect(codec.decode(codec.encode(input)), input);
+    });
+
+    test('dictionary roundtrip', () {
+      final dictionary = Uint8List.fromList(
+        utf8.encode('shared dictionary prefix for the zstd_neo test ' * 4),
+      );
+      final input = Uint8List.fromList(
+        utf8.encode('shared dictionary prefix for the zstd_neo test payload'),
+      );
+      final codec = ZstdCodec(level: 9, dictionary: dictionary);
+      final frame = codec.encode(input);
+      expect(codec.decode(frame), input);
+    });
+
+    test('encoder validates the level range', () {
       expect(() => ZstdEncoder(level: 0), throwsArgumentError);
-      expect(() => ZstdEncoder(level: 4), throwsUnsupportedError);
+      expect(() => ZstdEncoder(level: 20), throwsArgumentError);
+      expect(ZstdEncoder(level: 4).level, 4);
+      expect(ZstdEncoder(level: 19).level, 19);
     });
   });
 
   group('ZstdDecoder', () {
+    test('enforces maxOutputSize', () {
+      final frame = Uint8List.fromList(
+        const ZstdCodec().encode(utf8.encode('x' * 1000)),
+      );
+      expect(
+        () => ZstdDecoder(maxOutputSize: 100).decompress(frame),
+        throwsA(
+          isA<ZstdException>().having(
+            (error) => error.code,
+            'code',
+            ZstdErrorCode.outputTooLarge,
+          ),
+        ),
+      );
+    });
+
     test('rejects garbage', () {
       expect(
         () => const ZstdDecoder().decompress(Uint8List.fromList([1, 2, 3, 4])),

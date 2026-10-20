@@ -92,12 +92,33 @@ final class RingWindow {
     final mask = _mask;
     final writeStart = _pos;
     final readStart = (_pos - offset) & mask;
-    if (offset >= length &&
-        writeStart + length <= cap &&
-        readStart + length <= cap) {
-      _buffer.setRange(writeStart, writeStart + length, _buffer, readStart);
-      _pos = (writeStart + length) & mask;
-      return;
+    if (writeStart + length <= cap && readStart + length <= cap) {
+      if (offset >= length) {
+        _buffer.setRange(writeStart, writeStart + length, _buffer, readStart);
+        _pos = (writeStart + length) & mask;
+        return;
+      }
+      if (length >= 192) {
+        // Overlapping copy without wrap: copy the pattern, then double it from
+        // the destination start (each source range ends where the destination
+        // starts, so setRange never overlaps itself).
+        var copied = offset;
+        _buffer.setRange(writeStart, writeStart + copied, _buffer, readStart);
+        while (copied < length) {
+          var next = copied;
+          final remaining = length - copied;
+          if (next > remaining) next = remaining;
+          _buffer.setRange(
+            writeStart + copied,
+            writeStart + copied + next,
+            _buffer,
+            writeStart,
+          );
+          copied += next;
+        }
+        _pos = (writeStart + length) & mask;
+        return;
+      }
     }
     var write = writeStart;
     var read = readStart;

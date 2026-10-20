@@ -26,23 +26,20 @@ const int kMaxOffsetAccuracyLog = 8;
 
 /// A single FSE decoding table.
 ///
-/// Row `state` decodes to `symbols[state]`; feeding `numBits[state]` bits to
-/// `stateBase[state]` produces the next state.
+/// Row `state` decodes to a symbol and a state-update bit count packed into
+/// `entries[state]` (low byte: symbol, high byte: number of bits), while
+/// `stateBase[state]` is added to the bits read from the stream to produce the
+/// next state.
 final class FseTable {
-  FseTable(this.symbols, this.numBits, this.stateBase, this.accuracyLog);
+  FseTable(this.entries, this.stateBase, this.accuracyLog);
 
-  final Uint8List symbols;
-  final Uint8List numBits;
+  final Uint16List entries;
   final Uint16List stateBase;
   final int accuracyLog;
 
   /// The degenerate table used by `RLE_Mode`: one symbol, no bits consumed.
-  static FseTable rle(int symbol) => FseTable(
-    Uint8List.fromList(<int>[symbol]),
-    Uint8List(1),
-    Uint16List(1),
-    0,
-  );
+  static FseTable rle(int symbol) =>
+      FseTable(Uint16List.fromList(<int>[symbol]), Uint16List(1), 0);
 
   /// Builds a table from a normalized distribution.
   ///
@@ -130,7 +127,12 @@ final class FseTable {
       stateBase[i] = (nextStateDesc << bits) - size;
     }
 
-    return FseTable(symbols, numBits, stateBase, accuracyLog);
+    final entries = Uint16List(size);
+    for (var i = 0; i < size; i++) {
+      entries[i] = symbols[i] | (numBits[i] << 8);
+    }
+
+    return FseTable(entries, stateBase, accuracyLog);
   }
 
   /// Parses an FSE distribution table from [reader] and leaves it byte aligned

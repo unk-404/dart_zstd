@@ -239,7 +239,30 @@ final class BackwardBitReader {
     final newPosition = _bitPosition - n;
     int value;
     if (newPosition >= 0) {
-      value = readBitsLe(data, start, newPosition, n);
+      if (n <= 16) {
+        // Fast path for the Huffman and FSE hot loops: at most three bytes are
+        // touched, and all shifts stay below 32 bits on every platform.
+        final bytePosition = start + (newPosition >> 3);
+        final bitOffset = newPosition & 7;
+        final bitsNeeded = bitOffset + n;
+        if (bitsNeeded <= 8) {
+          value = (data[bytePosition] >> bitOffset) & ((1 << n) - 1);
+        } else if (bitsNeeded <= 16) {
+          value =
+              ((data[bytePosition] | (data[bytePosition + 1] << 8)) >>
+                  bitOffset) &
+              ((1 << n) - 1);
+        } else {
+          value =
+              ((data[bytePosition] |
+                      (data[bytePosition + 1] << 8) |
+                      (data[bytePosition + 2] << 16)) >>
+                  bitOffset) &
+              ((1 << n) - 1);
+        }
+      } else {
+        value = readBitsLe(data, start, newPosition, n);
+      }
     } else {
       final available = _bitPosition;
       if (available <= 0) {

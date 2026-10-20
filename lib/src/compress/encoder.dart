@@ -4,6 +4,7 @@ import 'dart:typed_data';
 import '../common/xxh64.dart';
 import 'block_encoder.dart';
 import 'byte_writer.dart';
+import 'dictionary.dart';
 import 'frame.dart';
 import 'match_finder.dart';
 
@@ -17,49 +18,83 @@ import 'match_finder.dart';
 /// final compressed = encoder.convert(utf8.encode('hello'));
 /// ```
 ///
-/// v0.1.0 implements levels 1..3, raw/RLE literals and the predefined FSE
-/// sequence distributions. It always produces valid frames, falling back to
-/// raw blocks whenever entropy coding would not pay off.
+/// Levels 1..19 are implemented. Levels up to 9 use fast/double-fast, greedy,
+/// lazy and lazy2 parsers; levels 10..19 use the same lazy2 parser with
+/// progressively deeper chain searches (the reference implementation's bt*
+/// optimal parsers are approximated, so very high levels may trail libzstd on
+/// ratio). Entropy coding covers Huffman literals (including treeless repeat)
+/// and predefined/custom/RLE/repeat FSE sequence tables.
 final class ZstdEncoder extends Converter<List<int>, List<int>> {
-  ZstdEncoder({this.level = 3, this.checksum = false}) {
-    if (level < 1) {
-      throw ArgumentError.value(level, 'level', 'must be >= 1');
-    }
-    if (level > 3) {
-      throw UnsupportedError(
-        'zstd_neo v0.1.0 implements levels 1..3; level $level is not '
-        'available yet',
-      );
+  ZstdEncoder({this.level = 3, this.checksum = false, this.dictionary}) {
+    if (level < 1 || level > 19) {
+      throw ArgumentError.value(level, 'level', 'must be in 1..19');
     }
   }
 
+  /// Compression level, 1..19.
   final int level;
+
+  /// Whether the encoder appends the 4-byte XXH64 content checksum.
   final bool checksum;
+
+  /// Optional raw-content or formatted zstd dictionary.
+  final Uint8List? dictionary;
 
   /// Fast path: compress a contiguous byte buffer.
   Uint8List compress(Uint8List input) {
+    final parsedDictionary = dictionary == null
+        ? null
+        : EncoderDictionary.parse(dictionary!);
     final parameters = compressionParametersFor(level, input.length);
     final configuredWindow = parameters.windowSize;
-    // Small inputs are stored as a single segment, which makes the content
-    // size the window size and saves the window descriptor byte. Large inputs
-    // keep a bounded window so decoders never have to allocate the whole
-    // content up front.
-    final singleSegment = input.length <= configuredWindow;
+    final prefixLength = parsedDictionary == null
+        ? 0
+        : _min(parsedDictionary.content.length, configuredWindow);
+    // Small inputs without a dictionary are stored as a single segment, which
+    // makes the content size the window size and saves the window descriptor.
+    // Dictionary frames always keep an explicit window so that dictionary
+    // references stay inside it.
+    final singleSegment =
+        parsedDictionary == null && input.length <= configuredWindow;
 
     final output = ByteWriter(input.length ~/ 2 + 64);
     writeFrameHeader(
       output,
-      contentSize: input.length,
+      contentSize: parsedDictionary == null || input.length >= 256
+          ? input.length
+          : null,
       windowSize: configuredWindow,
       singleSegment: singleSegment,
       checksum: checksum,
+      dictionaryId: parsedDictionary?.dictionaryId ?? 0,
     );
 
-    final blockEncoder = BlockEncoder(parameters);
+    final blockEncoder = BlockEncoder(
+      parameters,
+      initialRepCodes: parsedDictionary?.repOffsets,
+    );
     final checksumState = checksum ? Xxh64() : null;
 
-    if (input.isEmpty) {
-      blockEncoder.writeBlock(output, input, 0, 0, 0, last: true);
+    Uint8List data;
+    int blockBase;
+    if (prefixLength == 0) {
+      data = input;
+      blockBase = 0;
+    } else {
+      data = Uint8List(prefixLength + input.length);
+      data.setRange(
+        0,
+        prefixLength,
+        parsedDictionary!.content,
+        parsedDictionary.content.length - prefixLength,
+      );
+      data.setRange(prefixLength, data.length, input);
+      blockBase = prefixLength;
+      blockEncoder.loadPrefix(data, 0, prefixLength, 0);
+    }
+
+    if (input.isEmpty && prefixLength == 0) {
+      blockEncoder.writeBlock(output, data, 0, 0, 0, last: true);
     } else {
       final step = parameters.blockSize;
       var position = 0;
@@ -67,16 +102,28 @@ final class ZstdEncoder extends Converter<List<int>, List<int>> {
         final end = position + step < input.length
             ? position + step
             : input.length;
+        final last = end == input.length;
         blockEncoder.writeBlock(
           output,
-          input,
-          position,
-          end,
+          data,
+          blockBase + position,
+          blockBase + end,
           0,
-          last: end == input.length,
+          last: last,
         );
         checksumState?.update(input, position, end);
         position = end;
+      }
+      if (input.isEmpty) {
+        // Empty input with a dictionary: one empty last block.
+        blockEncoder.writeBlock(
+          output,
+          data,
+          blockBase,
+          blockBase,
+          0,
+          last: true,
+        );
       }
     }
 
@@ -103,8 +150,30 @@ final class _ZstdEncoderSink extends ByteConversionSink {
   _ZstdEncoderSink(this._encoder, this._output)
     : _parameters = compressionParametersForStreaming(_encoder.level),
       _checksum = _encoder.checksum ? Xxh64() : null {
-    _blockEncoder = BlockEncoder(_parameters);
+    final parsedDictionary = _encoder.dictionary == null
+        ? null
+        : EncoderDictionary.parse(_encoder.dictionary!);
+    _dictionaryId = parsedDictionary?.dictionaryId ?? 0;
+    final repCodes = parsedDictionary?.repOffsets;
+    _blockEncoder = BlockEncoder(_parameters, initialRepCodes: repCodes);
     _buffer = Uint8List(_parameters.windowSize + _parameters.blockSize);
+    if (parsedDictionary != null) {
+      final prefixLength = _min(
+        parsedDictionary.content.length,
+        _parameters.windowSize,
+      );
+      if (prefixLength > 0) {
+        _buffer.setRange(
+          0,
+          prefixLength,
+          parsedDictionary.content,
+          parsedDictionary.content.length - prefixLength,
+        );
+        _blockEncoder.loadPrefix(_buffer, 0, prefixLength, 0);
+        _bufferLength = prefixLength;
+        _blockStart = prefixLength;
+      }
+    }
   }
 
   final ZstdEncoder _encoder;
@@ -116,6 +185,7 @@ final class _ZstdEncoderSink extends ByteConversionSink {
   late final Uint8List _buffer;
   final ByteWriter _blockOutput = ByteWriter(zstdBlockBufferSize);
 
+  int _dictionaryId = 0;
   int _bufferLength = 0;
   int _blockStart = 0;
   int _streamBase = 0;
@@ -181,6 +251,7 @@ final class _ZstdEncoderSink extends ByteConversionSink {
       windowSize: _parameters.windowSize,
       singleSegment: false,
       checksum: _encoder.checksum,
+      dictionaryId: _dictionaryId,
     );
     _output.add(header.takeBytes());
   }
@@ -241,3 +312,5 @@ final class _ZstdEncoderSink extends ByteConversionSink {
 
 /// Default capacity for a reusable block assembly buffer.
 const int zstdBlockBufferSize = 128 * 1024 + 64;
+
+int _min(int a, int b) => a < b ? a : b;

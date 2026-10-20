@@ -19,7 +19,11 @@ final class ZstdDecoder extends Converter<List<int>, List<int>> {
     this.dictionary,
     this.maxWindowSize = zstdDefaultMaxWindowSize,
     this.verifyChecksum = true,
-  });
+    this.maxOutputSize,
+  }) : assert(
+         maxOutputSize == null || maxOutputSize >= 0,
+         'maxOutputSize must be non-negative',
+       );
 
   /// Optional Zstandard dictionary (formatted or raw content).
   final Uint8List? dictionary;
@@ -30,6 +34,15 @@ final class ZstdDecoder extends Converter<List<int>, List<int>> {
 
   /// Whether frame content checksums are verified.
   final bool verifyChecksum;
+
+  /// Optional upper bound on the total number of decompressed bytes produced
+  /// by one [decompress] call or by one chunked conversion, including all
+  /// concatenated frames.
+  ///
+  /// When the bound would be exceeded, decoding stops and throws
+  /// [ZstdException] with [ZstdErrorCode.outputTooLarge]. `null` (the default)
+  /// means unlimited.
+  final int? maxOutputSize;
 
   /// Fast path: decompress a contiguous byte buffer.
   Uint8List decompress(Uint8List input) {
@@ -69,6 +82,7 @@ final class ZstdDecoder extends Converter<List<int>, List<int>> {
     final parsedDictionary = _parseDictionary();
     final parts = <Uint8List>[];
     var position = 0;
+    var producedTotal = 0;
     while (position < input.length) {
       if (input.length - position < 4) {
         throw ZstdException(
@@ -79,8 +93,17 @@ final class ZstdDecoder extends Converter<List<int>, List<int>> {
       }
       final magic = readLe32(input, position);
       if (magic == zstdFrameMagic) {
-        final frame = _decodeFrame(input, position + 4, parsedDictionary);
+        final remaining = maxOutputSize == null
+            ? null
+            : maxOutputSize! - producedTotal;
+        final frame = _decodeFrame(
+          input,
+          position + 4,
+          parsedDictionary,
+          remaining,
+        );
         parts.add(frame.bytes);
+        producedTotal += frame.bytes.length;
         position = frame.next;
       } else if (magic >= zstdSkippableMagicMin &&
           magic <= zstdSkippableMagicMax) {
@@ -128,6 +151,7 @@ final class ZstdDecoder extends Converter<List<int>, List<int>> {
     Uint8List input,
     int descriptorStart,
     ParsedDictionary? parsedDictionary,
+    int? outputLimit,
   ) {
     final header = parseFrameHeader(
       input,
@@ -152,10 +176,21 @@ final class ZstdDecoder extends Converter<List<int>, List<int>> {
       buffer = grown;
     }
 
+    void checkOutputSize(int produced) {
+      final limit = outputLimit;
+      if (limit != null && produced > limit - context.frameOut) {
+        throw ZstdException(
+          ZstdErrorCode.outputTooLarge,
+          'decompressed output exceeds maxOutputSize ($limit bytes)',
+        );
+      }
+    }
+
     if (header.hasContentSize) {
-      final hint = header.frameContentSize < (1 << 20)
+      var hint = header.frameContentSize < (4 << 20)
           ? header.frameContentSize
-          : (1 << 20);
+          : (4 << 20);
+      if (outputLimit != null && hint > outputLimit) hint = outputLimit;
       if (hint > 0) ensureCapacity(hint);
     }
 
@@ -191,6 +226,7 @@ final class ZstdDecoder extends Converter<List<int>, List<int>> {
               offset: cursor,
             );
           }
+          checkOutputSize(blockSize);
           ensureCapacity(length + blockSize);
           if (blockSize > 0) {
             buffer.setRange(length, length + blockSize, input, cursor);
@@ -214,6 +250,7 @@ final class ZstdDecoder extends Converter<List<int>, List<int>> {
               offset: cursor,
             );
           }
+          checkOutputSize(blockSize);
           ensureCapacity(length + blockSize);
           final value = input[cursor];
           if (blockSize > 0) {
@@ -247,6 +284,7 @@ final class ZstdDecoder extends Converter<List<int>, List<int>> {
             cursor + blockSize,
             writer,
           );
+          checkOutputSize(writer.blockOut);
           length += writer.blockOut;
           context.blockOut = writer.blockOut;
           context.frameOut += writer.blockOut;
@@ -298,6 +336,14 @@ final class ZstdDecoder extends Converter<List<int>, List<int>> {
         'frame ended before its declared content size',
         offset: cursor,
       );
+    }
+
+    // Do not retain a large buffer for a tiny output (a frame may declare a
+    // large content size without actually producing it).
+    if (buffer.length > 4096 && length * 4 < buffer.length) {
+      final exact = Uint8List(length);
+      exact.setRange(0, length, buffer);
+      buffer = exact;
     }
 
     return _DecodedFrame(Uint8List.sublistView(buffer, 0, length), cursor);
@@ -369,6 +415,10 @@ final class _ZstdDecodingSink extends ByteConversionSink {
   int _blockSize = 0;
   int _blockNeeded = 0;
   bool _lastBlock = false;
+
+  /// Decompressed bytes handed to [sink] for the whole conversion, so that
+  /// [ZstdDecoder.maxOutputSize] covers concatenated frames as well.
+  int _totalOut = 0;
 
   @override
   void add(List<int> chunk) {
@@ -494,8 +544,21 @@ final class _ZstdDecodingSink extends ByteConversionSink {
           _start += _frameHeaderSize(descriptor);
           final dictionary = _dictionary();
           _checkDictionary(header, dictionary);
-          _context = FrameContext(header, dictionary);
-          _ring = RingWindow(header.windowSize);
+          final context = FrameContext(header, dictionary);
+          _context = context;
+          final ring = RingWindow(header.windowSize);
+          _ring = ring;
+          if (header.hasContentSize && header.frameContentSize > 0) {
+            // Pre-size the ring for frames whose output is small enough to be
+            // known up front; this avoids repeated history re-copies while the
+            // ring grows. Large/unknown frames keep growing lazily.
+            var expected = header.frameContentSize;
+            if (expected > header.windowSize) expected = header.windowSize;
+            if (expected > (4 << 20)) expected = 4 << 20;
+            final limit = decoder.maxOutputSize;
+            if (limit != null && expected > limit) expected = limit;
+            if (expected > 0) ring.ensure(0, expected + context.blockMax);
+          }
           _hasher = (header.contentChecksum && decoder.verifyChecksum)
               ? Xxh64()
               : null;
@@ -611,11 +674,13 @@ final class _ZstdDecodingSink extends ByteConversionSink {
           offset: _start,
         );
       }
+      _checkOutputSize(_blockSize);
       ring.ensure(history, _blockSize);
       final blockStart = ring.position;
       ring.writeRaw(_input, _start, _blockSize);
       context.blockOut = _blockSize;
       context.frameOut += _blockSize;
+      _totalOut += _blockSize;
       _emit(blockStart, _blockSize);
     } else if (_blockType == 1) {
       if (context.header.hasContentSize &&
@@ -626,11 +691,13 @@ final class _ZstdDecodingSink extends ByteConversionSink {
           offset: _start,
         );
       }
+      _checkOutputSize(_blockSize);
       ring.ensure(history, _blockSize);
       final blockStart = ring.position;
       ring.fill(_input[_start], _blockSize);
       context.blockOut = _blockSize;
       context.frameOut += _blockSize;
+      _totalOut += _blockSize;
       _emit(blockStart, _blockSize);
     } else {
       ring.ensure(history, context.blockMax);
@@ -654,7 +721,19 @@ final class _ZstdDecodingSink extends ByteConversionSink {
           offset: _start,
         );
       }
+      _checkOutputSize(produced);
+      _totalOut += produced;
       _emit(blockStart, produced);
+    }
+  }
+
+  void _checkOutputSize(int produced) {
+    final limit = decoder.maxOutputSize;
+    if (limit != null && produced > limit - _totalOut) {
+      throw ZstdException(
+        ZstdErrorCode.outputTooLarge,
+        'decompressed output exceeds maxOutputSize ($limit bytes)',
+      );
     }
   }
 

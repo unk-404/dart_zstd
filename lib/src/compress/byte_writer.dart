@@ -80,6 +80,13 @@ final class ByteWriter {
     writeUint32(value ~/ 0x100000000);
   }
 
+  /// Overwrites the two bytes at [offset] with a 16-bit little-endian value.
+  void patchUint16(int offset, int value) {
+    RangeError.checkValidRange(offset, offset + 2, _length);
+    _buffer[offset] = value & 0xFF;
+    _buffer[offset + 1] = (value >>> 8) & 0xFF;
+  }
+
   /// Overwrites the three bytes at [offset] with a 24-bit little-endian value.
   void patchUint24(int offset, int value) {
     RangeError.checkValidRange(offset, offset + 3, _length);

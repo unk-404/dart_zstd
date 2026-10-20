@@ -81,9 +81,9 @@ It also embeds all twelve files as base64 in
 the Dart web benchmark can use it. Every frame is decoded with libzstd and
 compared with its slice before anything is written.
 
-`bench` reads that manifest, measures level-3 compression, level-3
-decompression, level-19 decompression and the level-3 ratio, and writes
-canonical JSONL for the chart:
+`bench` reads that manifest, measures compression at levels 3, 9 and 19,
+decompression of the level-3 and level-19 frames, and the level-3/9/19
+ratios, then writes canonical JSONL for the chart:
 
 ```sh
 cargo run --release --manifest-path benchmark/rust_ref/Cargo.toml -- bench-data
@@ -94,8 +94,8 @@ dart format benchmark/bench_data.g.dart
 `bench` defaults to `--data benchmark/bench_data` and
 `--out build/bench/series-rust.jsonl`. Each operation runs three warm-up
 iterations, then repetitions until at least 300 ms elapsed or 200 repetitions.
-Throughput is MiB/s of plaintext; `ratio.<corpus>.l3` is compressed/original
-and is marked `direction = "lower"`.
+Throughput is MiB/s of plaintext; `ratio.<corpus>.l3`, `.l9` and `.l19` are
+compressed/original and are marked `direction = "lower"`.
 
 ## Why no `clap`?
 

@@ -1,9 +1,11 @@
 # One benchmark card comparing the pure-Dart codec with libzstd.
 #
 # `report.dart` writes the four canonical JSONL series; benchcat groups the
-# rows by their `group` field (Compress, Decompress · L3, Decompress · L19,
-# Ratio · L3). Missing series are skipped, so a run without a Web benchmark
-# still renders the AOT/Rust comparison.
+# rows by their `group` field (Compress · L3/L9/L19, Decompress · L3/L19,
+# Ratio · L3/L9/L19). Missing series are skipped, so a run without a Web
+# benchmark still renders the AOT/Rust comparison.
+#
+# 8 groups x 4 corpora = 32 rows per series.
 #
 # Inputs are repository-relative.
 
@@ -12,7 +14,7 @@ title = "zstd_neo vs zstd-rs"
 subtitle = "{platform} · commit {commit:short}"
 theme = "pastel"
 missing = "skip"
-max_rows = 24
+max_rows = 32
 bar_scale = "row"
 bar_curve = "linear"
 kaomoji = "(^_^)"

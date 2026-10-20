@@ -22,14 +22,31 @@ void writeFrameHeader(
   required int windowSize,
   required bool singleSegment,
   required bool checksum,
+  int dictionaryId = 0,
 }) {
   output.writeUint32(zstdFrameMagic);
   final fcsFlag = contentSize == null ? 0 : _fcsFlagFor(contentSize);
+  final dictionaryIdFlag = dictionaryId == 0
+      ? 0
+      : (dictionaryId < 0x100 ? 1 : (dictionaryId < 0x10000 ? 2 : 3));
   final descriptor =
-      (fcsFlag << 6) | (singleSegment ? 0x20 : 0) | (checksum ? 0x04 : 0);
+      (fcsFlag << 6) |
+      (singleSegment ? 0x20 : 0) |
+      (checksum ? 0x04 : 0) |
+      dictionaryIdFlag;
   output.writeByte(descriptor);
   if (!singleSegment) {
     output.writeByte(_windowDescriptor(windowSize));
+  }
+  switch (dictionaryIdFlag) {
+    case 0:
+      break;
+    case 1:
+      output.writeByte(dictionaryId);
+    case 2:
+      output.writeUint16(dictionaryId);
+    case 3:
+      output.writeUint32(dictionaryId);
   }
   if (contentSize != null) {
     switch (fcsFlag) {

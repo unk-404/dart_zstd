@@ -12,14 +12,14 @@
 /// and `series-rust.jsonl`. Every row is one canonical record:
 ///
 /// ```json
-/// {"id":"compress.dickens.l3","group":"Compress","label":"dickens",
+/// {"id":"compress.dickens.l3","group":"Compress · L3","label":"dickens",
 ///  "unit":"MiB/s","value":12.5,"stats":{"rme_pct":1.2,"samples":42}}
 /// ```
 ///
 /// `benchmark_test` reports operations per second; canonical throughput is
-/// MiB/s of plaintext (operations/s × 262144 / 1048576). The level-3 ratio is
-/// computed once for the AOT series only (js/wasm would repeat the identical
-/// value), using the same embedded corpus as the benchmark.
+/// MiB/s of plaintext (operations/s × 262144 / 1048576). Ratios at L3, L9 and
+/// L19 are computed once for the AOT series only (js/wasm would repeat the
+/// identical values), using the same embedded corpus as the benchmark.
 ///
 /// This is a native command-line tool; it may use `dart:io`. The benchmark
 /// itself (`benchmark_test.dart`) remains browser-safe.
@@ -42,11 +42,19 @@ const String _defaultRust = 'build/bench/series-rust.jsonl';
 const String _defaultOutDir = 'build/bench';
 
 const Map<String, int> _groupOrder = <String, int>{
-  'Compress': 0,
-  'Decompress · L3': 1,
-  'Decompress · L19': 2,
-  'Ratio · L3': 3,
+  'Compress · L3': 0,
+  'Compress · L9': 1,
+  'Compress · L19': 2,
+  'Decompress · L3': 3,
+  'Decompress · L19': 4,
+  'Ratio · L3': 5,
+  'Ratio · L9': 6,
+  'Ratio · L19': 7,
 };
+
+const Set<String> _compressLevels = <String>{'l3', 'l9', 'l19'};
+const Set<String> _decompressLevels = <String>{'l3', 'l19'};
+const Set<String> _ratioLevels = <String>{'l3', 'l9', 'l19'};
 
 final RegExp _idPattern = RegExp(
   r'^(compress|decompress|ratio)\.(.+)\.(l[0-9]+)$',
@@ -90,13 +98,19 @@ void _run(List<String> arguments) {
   final expectedThroughput = <String>{
     for (final corpus in corpora) ...<String>[
       'compress.$corpus.l3',
+      'compress.$corpus.l9',
+      'compress.$corpus.l19',
       'decompress.$corpus.l3',
       'decompress.$corpus.l19',
     ],
   };
   final expectedWithRatio = <String>{
     ...expectedThroughput,
-    for (final corpus in corpora) 'ratio.$corpus.l3',
+    for (final corpus in corpora) ...<String>[
+      'ratio.$corpus.l3',
+      'ratio.$corpus.l9',
+      'ratio.$corpus.l19',
+    ],
   };
 
   final aotRaw = _readRawJsonl(options.aot, required: true);
@@ -274,6 +288,28 @@ List<Map<String, Object?>> _readRawJsonl(
   return records;
 }
 
+String _expectedGroup(String metric, String level, String source, String id) {
+  final supported = switch (metric) {
+    'compress' => _compressLevels.contains(level),
+    'decompress' => _decompressLevels.contains(level),
+    'ratio' => _ratioLevels.contains(level),
+    _ => false,
+  };
+  if (!supported) {
+    throw FormatException(
+      '$source: unsupported id "$id" '
+      '(compress L3/L9/L19, decompress L3/L19, ratio L3/L9/L19)',
+    );
+  }
+  final metricLabel = switch (metric) {
+    'compress' => 'Compress',
+    'decompress' => 'Decompress',
+    'ratio' => 'Ratio',
+    _ => throw FormatException('$source: unsupported id "$id"'),
+  };
+  return '$metricLabel · L${level.substring(1)}';
+}
+
 Map<String, Object?> _convertBenchmarkRecord(
   Map<String, Object?> record,
   String source,
@@ -290,15 +326,7 @@ Map<String, Object?> _convertBenchmarkRecord(
   final corpus = match.group(2)!;
   final level = match.group(3)!;
 
-  final group = switch (metric) {
-    'compress' when level == 'l3' => 'Compress',
-    'decompress' when level == 'l3' => 'Decompress · L3',
-    'decompress' when level == 'l19' => 'Decompress · L19',
-    _ => throw FormatException(
-      '$source: unsupported benchmark id "$name" (metrics are '
-      'compress.*.l3, decompress.*.l3 and decompress.*.l19)',
-    ),
-  };
+  final group = _expectedGroup(metric, level, source, name);
   if (!_corpusIds().contains(corpus)) {
     throw FormatException('$source: unknown corpus "$corpus" in "$name"');
   }
@@ -379,13 +407,7 @@ Map<String, Object?> _normalizeRustRecord(
     throw FormatException('$source: "$id" stats.samples must be positive');
   }
 
-  final expectedGroup = switch (metric) {
-    'compress' when level == 'l3' => 'Compress',
-    'decompress' when level == 'l3' => 'Decompress · L3',
-    'decompress' when level == 'l19' => 'Decompress · L19',
-    'ratio' when level == 'l3' => 'Ratio · L3',
-    _ => throw FormatException('$source: unsupported id "$id"'),
-  };
+  final expectedGroup = _expectedGroup(metric, level, source, id);
   if (group != expectedGroup) {
     throw FormatException(
       '$source: "$id" has group "$group", expected "$expectedGroup"',
@@ -423,9 +445,12 @@ Map<String, Object?> _normalizeRustRecord(
   );
 }
 
-/// Computes `ratio.<corpus>.l3` once for the AOT series.
+/// Computes `ratio.<corpus>.l3`, `.l9` and `.l19` once for the AOT series.
 List<Map<String, Object?>> _computeRatios(String source) {
-  final encoder = ZstdEncoder(level: 3);
+  const levels = <int>[3, 9, 19];
+  final encoders = <int, ZstdEncoder>{
+    for (final level in levels) level: ZstdEncoder(level: level),
+  };
   final rows = <Map<String, Object?>>[];
   final seen = <String>{};
   for (final file in benchData) {
@@ -439,23 +464,27 @@ List<Map<String, Object?>> _computeRatios(String source) {
         'bytes, expected $sliceBytes',
       );
     }
-    final compressed = encoder.compress(plain);
-    final ratio = compressed.length / plain.length;
-    if (!ratio.isFinite || ratio <= 0) {
-      throw StateError('$source: degenerate ratio for ${file.corpus}');
+    for (final level in levels) {
+      final compressed = encoders[level]!.compress(plain);
+      final ratio = compressed.length / plain.length;
+      if (!ratio.isFinite || ratio <= 0) {
+        throw StateError(
+          '$source: degenerate level-$level ratio for ${file.corpus}',
+        );
+      }
+      rows.add(
+        _row(
+          id: 'ratio.${file.corpus}.l$level',
+          group: 'Ratio · L$level',
+          label: file.corpus,
+          unit: 'x',
+          direction: 'lower',
+          value: ratio,
+          rmePct: 0,
+          samples: 1,
+        ),
+      );
     }
-    rows.add(
-      _row(
-        id: 'ratio.${file.corpus}.l3',
-        group: 'Ratio · L3',
-        label: file.corpus,
-        unit: 'x',
-        direction: 'lower',
-        value: ratio,
-        rmePct: 0,
-        samples: 1,
-      ),
-    );
   }
   return rows;
 }

@@ -15,14 +15,20 @@ const int kHuffmanMaxSymbols = 256;
 
 /// A canonical Huffman decoding table.
 ///
-/// The depth is `maxBits`; a `maxBits`-bit prefix indexes [symbols] and
-/// [numBits] tells how many bits that symbol actually consumed.
+/// The depth is [maxBits]; a [maxBits]-bit prefix indexes [entries], which
+/// packs the decoded symbol in the low byte and its code length in the high
+/// byte.
 final class HuffmanTable {
-  HuffmanTable(this.symbols, this.numBits, this.maxBits);
+  HuffmanTable(this.entries, this.maxBits);
 
-  final Uint8List symbols;
-  final Uint8List numBits;
+  final Uint16List entries;
   final int maxBits;
+
+  /// Decoded symbol for [state].
+  int symbolAt(int state) => entries[state] & 0xFF;
+
+  /// Number of bits consumed by the symbol at [state].
+  int bitsAt(int state) => entries[state] >> 8;
 
   /// Parses a Huffman tree description from [reader].
   static HuffmanTable readFrom(ForwardBitReader reader) {
@@ -97,6 +103,8 @@ final class HuffmanTable {
 
     var state1 = bits.readBits(accuracyLog);
     var state2 = bits.readBits(accuracyLog);
+    final entries = table.entries;
+    final stateBase = table.stateBase;
     var count = 0;
     while (true) {
       if (count >= kHuffmanMaxSymbols - 1) {
@@ -105,9 +113,9 @@ final class HuffmanTable {
           'too many Huffman weights',
         );
       }
-      weights[count++] = table.symbols[state1];
-      final b1 = table.numBits[state1];
-      state1 = table.stateBase[state1] + bits.readBits(b1);
+      final entry1 = entries[state1];
+      weights[count++] = entry1 & 0xFF;
+      state1 = stateBase[state1] + bits.readBits(entry1 >> 8);
       if (bits.bitPosition < 0) {
         if (count >= kHuffmanMaxSymbols - 1) {
           throw const ZstdException(
@@ -115,7 +123,7 @@ final class HuffmanTable {
             'too many Huffman weights',
           );
         }
-        weights[count++] = table.symbols[state2];
+        weights[count++] = entries[state2] & 0xFF;
         break;
       }
 
@@ -125,9 +133,9 @@ final class HuffmanTable {
           'too many Huffman weights',
         );
       }
-      weights[count++] = table.symbols[state2];
-      final b2 = table.numBits[state2];
-      state2 = table.stateBase[state2] + bits.readBits(b2);
+      final entry2 = entries[state2];
+      weights[count++] = entry2 & 0xFF;
+      state2 = stateBase[state2] + bits.readBits(entry2 >> 8);
       if (bits.bitPosition < 0) {
         if (count >= kHuffmanMaxSymbols - 1) {
           throw const ZstdException(
@@ -135,7 +143,7 @@ final class HuffmanTable {
             'too many Huffman weights',
           );
         }
-        weights[count++] = table.symbols[state1];
+        weights[count++] = entries[state1] & 0xFF;
         break;
       }
     }
@@ -283,7 +291,12 @@ final class HuffmanTable {
       rankStart[b] = code + len;
     }
 
-    return HuffmanTable(symbols, tableBits, tableLog);
+    final entries = Uint16List(tableSize);
+    for (var row = 0; row < tableSize; row++) {
+      entries[row] = symbols[row] | (tableBits[row] << 8);
+    }
+
+    return HuffmanTable(entries, tableLog);
   }
 
   /// Decodes exactly [length] symbols into `dst[dstStart..]`.
@@ -312,12 +325,13 @@ final class HuffmanTable {
       );
     }
     final mask = kPow2[table.maxBits] - 1;
+    final entries = table.entries;
     var state = bits.readBits(table.maxBits);
     for (var i = 0; i < length; i++) {
-      final symbol = table.symbols[state];
-      final nb = table.numBits[state];
+      final entry = entries[state];
+      final nb = entry >> 8;
       final rest = bits.readBits(nb);
-      dst[dstStart + i] = symbol;
+      dst[dstStart + i] = entry & 0xFF;
       state = ((state << nb) + rest) & mask;
     }
     if (bits.bitPosition != -table.maxBits) {

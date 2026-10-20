@@ -20,6 +20,8 @@ Uint8List _fixtureZst(String name) => _b64(_fixture(name).zstBase64);
 
 Uint8List _fixtureBin(String name) => _b64(_fixture(name).binBase64);
 
+Uint8List _fixtureDict(String name) => _b64(_fixture(name).dictBase64!);
+
 ZstdInput _input(String name) =>
     webInputs.firstWhere((input) => input.name == name);
 
@@ -402,6 +404,118 @@ void main() {
       chunked.close();
       expect(sink.bytes, isEmpty);
       expect(sink.closed, isTrue);
+    });
+  });
+
+  group('maxOutputSize', () {
+    test('exact bound streams normally', () {
+      final compressed = _fixtureZst('text_16k_l3');
+      final expected = _fixtureBin('text_16k_l3');
+      expect(
+        _decodeChunked(
+          ZstdDecoder(maxOutputSize: expected.length),
+          compressed,
+          _uniformBoundaries(compressed.length, 31),
+        ),
+        expected,
+      );
+    });
+
+    test('bound below the output size throws outputTooLarge', () {
+      final compressed = _fixtureZst('text_16k_l3');
+      final expected = _fixtureBin('text_16k_l3');
+      final sink = _CollectingSink();
+      final chunked = ZstdDecoder(maxOutputSize: expected.length - 1)
+          .startChunkedConversion(sink);
+      expect(
+        () {
+          var previous = 0;
+          for (final boundary in _uniformBoundaries(compressed.length, 31)) {
+            chunked.add(Uint8List.sublistView(compressed, previous, boundary));
+            previous = boundary;
+          }
+          chunked.close();
+        },
+        throwsA(
+          isA<ZstdException>().having(
+            (error) => error.code,
+            'code',
+            ZstdErrorCode.outputTooLarge,
+          ),
+        ),
+      );
+      // The decoder must not have emitted more than the configured bound.
+      expect(sink.bytes.length, lessThanOrEqualTo(expected.length - 1));
+    });
+
+    test('bound covers concatenated frames', () {
+      final compressed = _fixtureZst('multiframe');
+      final expected = _fixtureBin('multiframe');
+      expect(
+        _decodeChunked(
+          ZstdDecoder(maxOutputSize: expected.length),
+          compressed,
+          _uniformBoundaries(compressed.length, 7),
+        ),
+        expected,
+      );
+      expect(
+        () => _decodeChunked(
+          ZstdDecoder(maxOutputSize: expected.length - 1),
+          compressed,
+          _uniformBoundaries(compressed.length, 7),
+        ),
+        throwsA(
+          isA<ZstdException>().having(
+            (error) => error.code,
+            'code',
+            ZstdErrorCode.outputTooLarge,
+          ),
+        ),
+      );
+    });
+
+    test('dictionary frames honour the bound', () {
+      final compressed = _fixtureZst('structdict');
+      final expected = _fixtureBin('structdict');
+      final dictionary = _fixtureDict('structdict');
+      expect(
+        _decodeChunked(
+          ZstdDecoder(dictionary: dictionary, maxOutputSize: expected.length),
+          compressed,
+          _uniformBoundaries(compressed.length, 97),
+        ),
+        expected,
+      );
+      expect(
+        () => _decodeChunked(
+          ZstdDecoder(
+            dictionary: dictionary,
+            maxOutputSize: expected.length - 1,
+          ),
+          compressed,
+          _uniformBoundaries(compressed.length, 97),
+        ),
+        throwsA(
+          isA<ZstdException>().having(
+            (error) => error.code,
+            'code',
+            ZstdErrorCode.outputTooLarge,
+          ),
+        ),
+      );
+    });
+
+    test('zero bound allows an empty checksummed frame', () {
+      final compressed = _b64('KLUv/SQAAQAAmenYUQ==');
+      expect(
+        _decodeChunked(
+          const ZstdDecoder(maxOutputSize: 0),
+          compressed,
+          _uniformBoundaries(compressed.length, 3),
+        ),
+        isEmpty,
+      );
     });
   });
 

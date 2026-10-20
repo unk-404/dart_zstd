@@ -4,6 +4,10 @@
 /// `bench_data.g.dart`, so this file runs unchanged on the VM (AOT/JIT),
 /// dart2js and dart2wasm. It never touches `dart:io`.
 ///
+/// The suite covers the production encoder levels: compression at L3, L9 and
+/// L19, decompression of the committed L3/L19 frames, and (in `report.dart`)
+/// the L3/L9/L19 ratios.
+///
 /// Run it through the `benchmark_test` CLI, for example:
 ///
 /// ```text
@@ -38,6 +42,18 @@ const int _minSamples = 10;
 const double _targetRme = 2.0;
 const int _maxSamples = 100;
 
+/// Registers one benchmark with the CI-friendly sampling settings.
+void _benchmark(String id, void Function() body) {
+  benchmark(
+    id,
+    body,
+    minDuration: _minDuration,
+    minSamples: _minSamples,
+    targetRme: _targetRme,
+    maxSamples: _maxSamples,
+  );
+}
+
 /// One corpus: plaintext plus its deterministic level-3 and level-19 frames.
 final class _Corpus {
   _Corpus({
@@ -52,8 +68,10 @@ final class _Corpus {
   final Uint8List l3;
   final Uint8List l19;
 
-  /// One encoder per corpus, created once outside the benchmark closure.
-  final ZstdEncoder encoder = ZstdEncoder(level: 3);
+  /// One encoder per measured level, created once outside the closures.
+  final ZstdEncoder encoderL3 = ZstdEncoder(level: 3);
+  final ZstdEncoder encoderL9 = ZstdEncoder(level: 9);
+  final ZstdEncoder encoderL19 = ZstdEncoder(level: 19);
 }
 
 List<_Corpus> _loadCorpora() {
@@ -123,38 +141,25 @@ void main() {
   });
 
   for (final corpus in corpora) {
-    benchmark(
-      'compress.${corpus.id}.l3',
-      () {
-        _sink = corpus.encoder.compress(corpus.plain).length;
-      },
-      minDuration: _minDuration,
-      minSamples: _minSamples,
-      targetRme: _targetRme,
-      maxSamples: _maxSamples,
-    );
+    _benchmark('compress.${corpus.id}.l3', () {
+      _sink = corpus.encoderL3.compress(corpus.plain).length;
+    });
 
-    benchmark(
-      'decompress.${corpus.id}.l3',
-      () {
-        _sink = decoder.decompress(corpus.l3).length;
-      },
-      minDuration: _minDuration,
-      minSamples: _minSamples,
-      targetRme: _targetRme,
-      maxSamples: _maxSamples,
-    );
+    _benchmark('compress.${corpus.id}.l9', () {
+      _sink = corpus.encoderL9.compress(corpus.plain).length;
+    });
 
-    benchmark(
-      'decompress.${corpus.id}.l19',
-      () {
-        _sink = decoder.decompress(corpus.l19).length;
-      },
-      minDuration: _minDuration,
-      minSamples: _minSamples,
-      targetRme: _targetRme,
-      maxSamples: _maxSamples,
-    );
+    _benchmark('compress.${corpus.id}.l19', () {
+      _sink = corpus.encoderL19.compress(corpus.plain).length;
+    });
+
+    _benchmark('decompress.${corpus.id}.l3', () {
+      _sink = decoder.decompress(corpus.l3).length;
+    });
+
+    _benchmark('decompress.${corpus.id}.l19', () {
+      _sink = decoder.decompress(corpus.l19).length;
+    });
   }
 
   tearDownAll(() {

@@ -12,24 +12,55 @@ import 'dart:typed_data';
 
 import 'package:blit/blit.dart';
 
+import 'common/constants.dart';
 import 'compress/encoder.dart';
 import 'decompress/decoder.dart';
 
-/// A Zstandard [Codec] with a fixed compression level.
+/// A Zstandard [Codec] with fixed encoder and decoder options.
+///
+/// The encoder supports levels 1..19. The decoder verifies checksums by
+/// default, supports formatted and raw-content dictionaries, and can enforce
+/// a maximum window and output size.
 final class ZstdCodec extends Codec<List<int>, List<int>> {
-  const ZstdCodec({this.level = 3, this.checksum = false});
+  const ZstdCodec({
+    this.level = 3,
+    this.checksum = false,
+    this.dictionary,
+    this.maxWindowSize = zstdDefaultMaxWindowSize,
+    this.verifyChecksum = true,
+    this.maxOutputSize,
+  });
 
-  /// Compression level. `1..3` are implemented in this version.
+  /// Compression level, `1..19`.
   final int level;
 
   /// Whether the encoder appends the 4-byte XXH64 content checksum.
   final bool checksum;
 
-  @override
-  ZstdEncoder get encoder => ZstdEncoder(level: level, checksum: checksum);
+  /// Optional formatted or raw-content zstd dictionary, used by both the
+  /// encoder and the decoder.
+  final Uint8List? dictionary;
+
+  /// Upper bound on a frame's declared window accepted by the decoder.
+  final int maxWindowSize;
+
+  /// Whether the decoder verifies frame content checksums.
+  final bool verifyChecksum;
+
+  /// Optional upper bound on decompressed bytes; see [ZstdDecoder].
+  final int? maxOutputSize;
 
   @override
-  ZstdDecoder get decoder => ZstdDecoder();
+  ZstdEncoder get encoder =>
+      ZstdEncoder(level: level, checksum: checksum, dictionary: dictionary);
+
+  @override
+  ZstdDecoder get decoder => ZstdDecoder(
+    dictionary: dictionary,
+    maxWindowSize: maxWindowSize,
+    verifyChecksum: verifyChecksum,
+    maxOutputSize: maxOutputSize,
+  );
 
   /// Compresses [input] without an intermediate `List<int>` copy.
   Uint8List compress(Uint8List input) => encoder.compress(input);
