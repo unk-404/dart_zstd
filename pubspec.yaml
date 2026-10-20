@@ -3,6 +3,7 @@ description: >-
   Pure Dart implementation of Zstandard (zstd): a complete decoder and a
   streaming encoder, running on the Dart VM, JavaScript and WebAssembly.
 version: 0.1.0
+repository: https://github.com/unk-404/dart_zstd
 topics:
   - zstd
   - zstandard
