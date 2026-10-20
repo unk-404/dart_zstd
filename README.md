@@ -1,20 +1,21 @@
-# zstd_neo
+﻿# zstd_neo
 
 A from-scratch, **pure Dart** implementation of the
 [Zstandard](https://facebook.github.io/zstd/) compression format.
 
-- Runs on the Dart VM, dart2js and dart2wasm — no FFI, no native libraries.
+- Runs on the Dart VM, dart2js and dart2wasm 鈥?no FFI, no native libraries.
 - Complete Zstandard decoder, including dictionaries, skippable frames,
   concatenated frames, content checksums and streaming.
 - Streaming encoder with `Converter` / `startChunkedConversion`, plus a
   one-shot fast path.
 
-> **Status: v0.1.1 (production).** The decoder covers the full Zstandard
-> format. The encoder now covers levels 1–19 with Huffman literals (1/4 streams,
-> treeless repeat), custom FSE sequence tables, repeat/RLE modes and
-> raw/formatted dictionary support. Levels 10–19 use a deeper-search lazy2
-> parser rather than the reference `btopt`, so they produce valid frames and
-> competitive ratios but may trail libzstd at the very highest levels.
+> **Status: v0.1.2 (development).** Format conformance is verified against the
+> official zstd `decodecorpus` corpus; the remaining v0.1.2 phase is performance.
+> The encoder covers levels 1鈥?9 with Huffman literals (1/4 streams, treeless
+> repeat), custom FSE sequence tables, repeat/RLE modes and raw/formatted
+> dictionary support. Levels 10鈥?9 use a deeper-search lazy2 parser rather than
+> the reference `btopt`, so they produce valid frames and competitive ratios but
+> may trail libzstd at the very highest levels.
 
 ## Usage
 
@@ -89,20 +90,33 @@ set `maxOutputSize` (and optionally a smaller `maxWindowSize`).
 
 | Feature | Decode | Encode |
 | --- | :---: | :---: |
-| Raw / RLE / compressed blocks | ✓ | ✓ |
-| Raw / RLE literals | ✓ | ✓ |
-| Huffman literals, 1 & 4 streams | ✓ | ✓ |
-| Treeless literals / repeat Huffman | ✓ | ✓ |
-| Predefined / RLE / FSE / repeat sequence tables | ✓ | ✓ |
-| Repeat offsets | ✓ | ✓ |
-| Content checksum (XXH64) | ✓ | optional |
-| Frame content size / single segment | ✓ | one-shot |
-| Skippable frames, concatenated frames | ✓ | — |
-| Structured & raw dictionaries | ✓ | ✓ |
-| Streaming | ✓ | ✓ |
+| Raw / RLE / compressed blocks | 鉁?| 鉁?|
+| Raw / RLE literals | 鉁?| 鉁?|
+| Huffman literals, 1 & 4 streams | 鉁?| 鉁?|
+| Treeless literals / repeat Huffman | 鉁?| 鉁?|
+| Predefined / RLE / FSE / repeat sequence tables | 鉁?| 鉁?|
+| Repeat offsets | 鉁?| 鉁?|
+| Content checksum (XXH64) | 鉁?| optional |
+| Frame content size / single segment | 鉁?| one-shot |
+| Skippable frames, concatenated frames | 鉁?| 鈥?|
+| Structured & raw dictionaries | 鉁?| 鉁?|
+| Streaming | 鉁?| 鉁?|
 
 The decoder rejects windows larger than `maxWindowSize` (64 MiB by default)
 and verifies checksums when present.
+
+## Conformance
+
+Format conformance is verified against the **official zstd `decodecorpus`**
+generator, not just hand-written vectors: a committed corpus of 278 frames
+(5.9 MB with plaintext) covers random frames, forced content sizes, 128 KiB
+blocks, forced raw/RLE/compressed blocks and larger content. Every frame is
+byte-compared in `test/conformance_test.dart`, alongside official golden/error
+vectors and differential fuzzing against libzstd 1.5.7.
+
+See [CONFORMANCE.md](CONFORMANCE.md) for the exact coverage matrix and the
+documented resource limits (window/output limits, 8-byte content-size ceiling,
+and the fact that legacy/seekable formats and LDM encoding are out of scope).
 
 ## Performance
 
@@ -144,5 +158,6 @@ pure Dart.
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Test vectors derived from the reference zstd
+MIT 鈥?see [LICENSE](LICENSE). Test vectors derived from the reference zstd
 project and the Silesia corpus are covered by [NOTICE](NOTICE).
+

@@ -2,7 +2,7 @@ name: zstd_neo
 description: >-
   Pure Dart implementation of Zstandard (zstd): a complete decoder and a
   streaming encoder, running on the Dart VM, JavaScript and WebAssembly.
-version: 0.1.1
+version: 0.1.2
 repository: https://github.com/unk-404/dart_zstd
 topics:
   - zstd
