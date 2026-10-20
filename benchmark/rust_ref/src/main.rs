@@ -13,6 +13,8 @@
 //! interop job points `ZSTD_REF` at it.
 
 mod base64;
+mod bench;
+mod bench_data;
 mod fixtures;
 
 use std::env;
@@ -29,6 +31,8 @@ USAGE:
                                [--dictionary FILE]
     zstd_ref decode <in> <out> [--dictionary FILE]
     zstd_ref gen-fixtures [--out DIR] [--corpus DIR] [--zstd-tests DIR]
+    zstd_ref bench-data [--out DIR] [--corpus DIR] [--dart-out FILE]
+    zstd_ref bench [--data DIR] [--out FILE]
     zstd_ref version
 
 encode defaults:
@@ -43,7 +47,17 @@ gen-fixtures defaults:
     --corpus benchmark/corpus/silesia Silesia corpus root
     --zstd-tests test/zstd-tests      official zstd test vectors (optional)
 
-The output of `gen-fixtures` is deterministic for a given libzstd version.";
+bench-data defaults:
+    --out benchmark/bench_data        slice + frame output directory
+    --corpus benchmark/corpus/silesia Silesia corpus root
+    --dart-out benchmark/bench_data.g.dart  browser-safe base64 constants
+
+bench defaults:
+    --data benchmark/bench_data       directory written by bench-data
+    --out build/bench/series-rust.jsonl
+
+The output of `gen-fixtures` and `bench-data` is deterministic for a given
+libzstd version.";
 
 fn main() {
     if let Err(error) = run() {
@@ -64,6 +78,8 @@ fn run() -> Result<(), Box<dyn Error>> {
         "encode" => encode_cli(&rest),
         "decode" => decode_cli(&rest),
         "gen-fixtures" => fixtures::generate(&rest),
+        "bench-data" => bench_data::generate(&rest),
+        "bench" => bench::run(&rest),
         "version" | "--version" | "-V" => {
             println!(
                 "zstd_ref {} (zstd crate 0.14, libzstd {})",

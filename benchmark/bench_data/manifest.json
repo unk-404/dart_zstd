@@ -1,0 +1,51 @@
+{
+  "version": 1,
+  "sliceBytes": 262144,
+  "libzstd": "1.5.7",
+  "corpora": [
+    {
+      "id": "dickens",
+      "source": "benchmark/corpus/silesia/dickens",
+      "bytes": 262144,
+      "plain": "dickens.bin",
+      "plainBytes": 262144,
+      "l3": "dickens.l3.zst",
+      "l3Bytes": 101735,
+      "l19": "dickens.l19.zst",
+      "l19Bytes": 86985
+    },
+    {
+      "id": "xml",
+      "source": "benchmark/corpus/silesia/xml",
+      "bytes": 262144,
+      "plain": "xml.bin",
+      "plainBytes": 262144,
+      "l3": "xml.l3.zst",
+      "l3Bytes": 20285,
+      "l19": "xml.l19.zst",
+      "l19Bytes": 12998
+    },
+    {
+      "id": "x-ray",
+      "source": "benchmark/corpus/silesia/x-ray",
+      "bytes": 262144,
+      "plain": "x-ray.bin",
+      "plainBytes": 262144,
+      "l3": "x-ray.l3.zst",
+      "l3Bytes": 190622,
+      "l19": "x-ray.l19.zst",
+      "l19Bytes": 165397
+    },
+    {
+      "id": "osdb",
+      "source": "benchmark/corpus/silesia/osdb",
+      "bytes": 262144,
+      "plain": "osdb.bin",
+      "plainBytes": 262144,
+      "l3": "osdb.l3.zst",
+      "l3Bytes": 96616,
+      "l19": "osdb.l19.zst",
+      "l19Bytes": 91631
+    }
+  ]
+}

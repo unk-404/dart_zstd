@@ -94,9 +94,12 @@ and verifies checksums when present.
 
 ## Performance
 
-The benchmark harness — `benchmark_test` timings compared with the Rust `zstd`
-crate on the bundled Silesia corpus, rendered by `benchcat` — ships with the
-next milestone. Its output will be committed to `assets/benchmarks.svg`.
+![zstd_neo benchmarks](https://raw.githubusercontent.com/unk-404/dart_zstd/HEAD/assets/benchmarks.svg)
+
+The card is rendered from `benchmark_test` timings (Dart AOT, JS and Wasm)
+against the Rust `zstd` crate on 256 KiB Silesia slices. It is generated and
+committed automatically by CI on the default branch; a missing series is
+omitted rather than faked.
 
 The decoder currently reaches roughly 130 MiB/s on 64 KiB of English text
 (compressed, one-shot, JIT), 241 MiB/s on level-19 text, and 684 MiB/s on the

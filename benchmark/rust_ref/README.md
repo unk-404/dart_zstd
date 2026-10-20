@@ -27,6 +27,8 @@ zstd_ref encode <in> <out> [--level N] [--checksum] [--no-content-size]
                            [--dictionary FILE]
 zstd_ref decode <in> <out> [--dictionary FILE]
 zstd_ref gen-fixtures [--out DIR] [--corpus DIR] [--zstd-tests DIR]
+zstd_ref bench-data [--out DIR] [--corpus DIR] [--dart-out FILE]
+zstd_ref bench [--data DIR] [--out FILE]
 zstd_ref version
 ```
 
@@ -62,6 +64,39 @@ Paths in `gen-fixtures` default to the repository layout
 from elsewhere. Missing official zstd vectors only produce a warning, so the
 crate can be built and used by CI without a zstd source checkout.
 
+## Benchmark data and series
+
+`bench-data` writes the deterministic 256 KiB benchmark slices to
+`benchmark/bench_data/`:
+
+| file | contents |
+| --- | --- |
+| `<corpus>.bin` | first 262,144 bytes of dickens / xml / x-ray / osdb |
+| `<corpus>.l3.zst` | libzstd level 3 frame, content checksum on |
+| `<corpus>.l19.zst` | libzstd level 19 frame, content checksum on |
+| `manifest.json` | ids, source paths, byte counts and frame sizes |
+
+It also embeds all twelve files as base64 in
+[`benchmark/bench_data.g.dart`](../bench_data.g.dart), which imports nothing so
+the Dart web benchmark can use it. Every frame is decoded with libzstd and
+compared with its slice before anything is written.
+
+`bench` reads that manifest, measures level-3 compression, level-3
+decompression, level-19 decompression and the level-3 ratio, and writes
+canonical JSONL for the chart:
+
+```sh
+cargo run --release --manifest-path benchmark/rust_ref/Cargo.toml -- bench-data
+cargo run --release --manifest-path benchmark/rust_ref/Cargo.toml -- bench
+dart format benchmark/bench_data.g.dart
+```
+
+`bench` defaults to `--data benchmark/bench_data` and
+`--out build/bench/series-rust.jsonl`. Each operation runs three warm-up
+iterations, then repetitions until at least 300 ms elapsed or 200 repetitions.
+Throughput is MiB/s of plaintext; `ratio.<corpus>.l3` is compressed/original
+and is marked `direction = "lower"`.
+
 ## Why no `clap`?
 
 The CLI is deliberately dependency-light: `zstd` is the only dependency. The
@@ -75,6 +110,8 @@ source (`src/fixtures.rs`).
 | --- | --- |
 | `src/main.rs` | CLI, frame encode/decode helpers |
 | `src/fixtures.rs` | deterministic fixture matrix + `fixtures.g.dart` emitter |
+| `src/bench_data.rs` | Silesia slices, L3/L19 frames, manifest + `bench_data.g.dart` emitter |
+| `src/bench.rs` | libzstd measurements, canonical JSONL series |
 | `src/base64.rs` | minimal standard base64 encoder (no dependency) |
 
 See [`test/fixtures/README.md`](../../test/fixtures/README.md) for fixture

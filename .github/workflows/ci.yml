@@ -46,3 +46,62 @@ jobs:
         run: dart test -p chrome
       - name: dart2wasm
         run: dart test -p chrome -c dart2wasm
+
+  benchmark:
+    # TEST must be green first; the chart is only committed from the default
+    # branch (or a manual run), never from a pull request.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' &&
+       (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main'))
+    needs: [analyze, test, web]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: stable
+      - uses: dtolnay/rust-toolchain@stable
+      - run: dart pub get
+      - name: Build reference zstd
+        run: cargo build --release --manifest-path benchmark/rust_ref/Cargo.toml
+      - name: Ensure output directory
+        run: mkdir -p build/bench
+      - name: Rust reference benchmark
+        run: >-
+          cargo run --release --manifest-path benchmark/rust_ref/Cargo.toml --
+          bench --out build/bench/series-rust.jsonl
+      - name: Dart AOT benchmark
+        run: >-
+          dart run benchmark_test --compile aot --output jsonl
+          benchmark/benchmark_test.dart > build/bench/raw-dart-aot.jsonl
+      - name: Dart JS benchmark
+        run: >-
+          dart run benchmark_test --compile js --output jsonl
+          benchmark/benchmark_test.dart > build/bench/raw-dart-js.jsonl
+      - name: Dart Wasm benchmark
+        run: >-
+          dart run benchmark_test --compile wasm --output jsonl
+          benchmark/benchmark_test.dart > build/bench/raw-dart-wasm.jsonl
+      - name: Convert to canonical report
+        run: dart run benchmark/report.dart
+      - name: Render the benchmark card
+        uses: unk-404/benchcat@master
+        with:
+          config: benchmark/benchcat.toml
+          format: jsonl
+          out: assets/benchmarks.svg
+      - name: Commit the refreshed card
+        run: |
+          git add assets/benchmarks.svg
+          if git diff --cached --quiet; then
+            echo "benchmark chart unchanged"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "chore(bench): refresh chart [skip ci]"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
