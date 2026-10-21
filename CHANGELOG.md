@@ -1,3 +1,17 @@
+## 0.2.1
+
+- Upgrade to `blit 0.2.1` and use its `UnsafeBytes` for an externally owned
+  decode buffer. `ZstdDecoder.decompressUnsafe` returns a `ZstdBuffer` whose
+  memory is native `malloc` (VM) or the web WebAssembly-memory arena; call
+  `free()` exactly once. It is ~1.2x faster than managed `decompress` on the
+  local AOT benchmark (500 x 256 KiB: 463 ms -> 382 ms).
+- Keep `decompressInto` for caller-provided `Uint8List` output and
+  `decompress` for a managed result.
+- Add unsafe-buffer tests; the full suite is 577 tests with `ZSTD_REF`.
+- Document that the 80%-of-native pure-Dart target is not reached; v2 remains
+  ~37-40% native, and the externally owned path removes output GC/allocation
+  overhead only.
+
 ## 0.2.0
 
 ### v2 engine

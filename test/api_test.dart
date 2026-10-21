@@ -141,5 +141,17 @@ void main() {
       expect(written, expected.length);
       expect(output, expected);
     });
+
+    test('decompressUnsafe returns an externally owned buffer', () {
+      final expected = utf8.encode('unsafe external buffer ' * 100);
+      final frame = Uint8List.fromList(const ZstdCodec().encode(expected));
+      final buffer = const ZstdDecoder().decompressUnsafe(frame);
+      try {
+        expect(buffer.length, expected.length);
+        expect(buffer.view, expected);
+      } finally {
+        buffer.free();
+      }
+    });
   });
 }

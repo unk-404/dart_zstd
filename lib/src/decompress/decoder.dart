@@ -1,6 +1,8 @@
 import 'dart:convert';
 import 'dart:typed_data';
 
+import 'package:blit/unsafe.dart';
+
 import '../common/constants.dart';
 import '../common/errors.dart';
 import '../common/xxh64.dart';
@@ -11,6 +13,7 @@ import 'dictionary.dart';
 import 'fast_flag.dart' if (dart.library.js_interop) 'fast_flag_web.dart';
 import 'fast_scan.dart';
 import 'frame.dart';
+import 'unsafe_buffer.dart';
 import 'window.dart';
 
 /// Cached v2 engines keyed by the immutable decoder options object.
@@ -154,6 +157,50 @@ final class ZstdDecoder extends Converter<List<int>, List<int>> {
     }
     output.setRange(outputOffset, outputOffset + decoded.length, decoded);
     return decoded.length;
+  }
+
+  /// Decompresses into a buffer allocated outside the Dart GC.
+  ///
+  /// The returned [ZstdBuffer] owns a blit [UnsafeBytes] allocation (native
+  /// `malloc`, or the web WebAssembly-memory arena). Call [ZstdBuffer.free]
+  /// exactly once after using [ZstdBuffer.view]. This path avoids the managed
+  /// output allocation of [decompress] and is intended for high-throughput
+  /// callers that can manage the lifetime explicitly.
+  ZstdBuffer decompressUnsafe(Uint8List input) {
+    _checkConfiguration();
+    if (kUseFastDecoder) {
+      final total = fastOutputSize(input, maxWindowSize, maxOutputSize);
+      if (total != null) {
+        final capacity = total + zstdBlockSizeMax;
+        final allocation = UnsafeBytes.alloc(capacity);
+        final view = allocation.view(capacity);
+        try {
+          final written = _fastDecoderFor(this).decodeInto(input, view);
+          if (written != total) {
+            throw const ZstdException(
+              ZstdErrorCode.invalidFrameHeader,
+              'decoded size does not match the declared frame content size',
+            );
+          }
+          return ZstdBuffer.fromUnsafe(allocation, written);
+        } on ZstdException {
+          allocation.free();
+          rethrow;
+        } catch (error) {
+          allocation.free();
+          throw ZstdException(
+            ZstdErrorCode.invalidFrameHeader,
+            'corrupt zstd data: $error',
+          );
+        }
+      }
+    }
+    final decoded = _decompressAll(input);
+    final allocation = UnsafeBytes.alloc(decoded.isEmpty ? 1 : decoded.length);
+    if (decoded.isNotEmpty) {
+      allocation.view(decoded.length).setAll(0, decoded);
+    }
+    return ZstdBuffer.fromUnsafe(allocation, decoded.length);
   }
 
   static V2ZstdDecoder _fastDecoderFor(ZstdDecoder decoder) {

@@ -8,3 +8,4 @@ export 'src/codec.dart' show ZstdCodec;
 export 'src/common/errors.dart' show ZstdErrorCode, ZstdException;
 export 'src/compress/encoder.dart' show ZstdEncoder;
 export 'src/decompress/decoder.dart' show ZstdDecoder;
+export 'src/decompress/unsafe_buffer.dart' show ZstdBuffer;
