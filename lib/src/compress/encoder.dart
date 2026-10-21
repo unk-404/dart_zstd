@@ -2,9 +2,11 @@ import 'dart:convert';
 import 'dart:typed_data';
 
 import '../common/xxh64.dart';
+import '../v2/compress/encoder.dart';
 import 'block_encoder.dart';
 import 'byte_writer.dart';
 import 'dictionary.dart';
+import 'fast_flag.dart' if (dart.library.js_interop) 'fast_flag_web.dart';
 import 'frame.dart';
 import 'match_finder.dart';
 
@@ -40,8 +42,25 @@ final class ZstdEncoder extends Converter<List<int>, List<int>> {
   /// Optional raw-content or formatted zstd dictionary.
   final Uint8List? dictionary;
 
+  /// Cached single-shot v2 encoder (streaming still uses this v1 engine).
+  ZstdV2Encoder? _fastEncoder;
+
   /// Fast path: compress a contiguous byte buffer.
   Uint8List compress(Uint8List input) {
+    if (kUseFastEncoder) {
+      final dictionary = this.dictionary;
+      return (_fastEncoder ??= ZstdV2Encoder(
+        level: level,
+        checksum: checksum,
+        dictionary: dictionary != null && dictionary.isNotEmpty
+            ? dictionary
+            : null,
+      )).compress(input);
+    }
+    return _compressV1(input);
+  }
+
+  Uint8List _compressV1(Uint8List input) {
     final parsedDictionary = dictionary == null
         ? null
         : EncoderDictionary.parse(dictionary!);

@@ -9,20 +9,19 @@ A from-scratch, **pure Dart** implementation of the
 - Streaming encoder with `Converter` / `startChunkedConversion`, plus a
   one-shot fast path.
 
-> **Status: v0.1.2 (production).** Format conformance is verified against the
-> official zstd `decodecorpus` corpus, and the v0.1.2 performance phase improved
-> the AOT encoder by roughly 1.55x/1.85x/2.21x at levels 3/9/19 and the AOT
-> decoder by roughly 1.3–1.5x, with larger JS/Wasm gains.
-> The encoder covers levels 1–19 with Huffman literals (1/4 streams, treeless
-> repeat), custom FSE sequence tables, repeat/RLE modes and raw/formatted
-> dictionary support. Levels 10–19 use a deeper-search lazy2 parser rather than
-> the reference `btopt`, so they produce valid frames and competitive ratios but
-> may trail libzstd at the very highest levels.
+> **Status: v0.2.0.** The new v2 one-shot engine is the default on the Dart
+> VM/AOT: AOT `decompressInto` is roughly 1.4-1.6x the v0.1.2 decoder
+> (allocating `decompress` ~1.2-1.4x) and one-shot encode roughly 1.1x; measured throughput is about 37-40% of native zstd (decode) and
+> 20% (L3 encode). The 80%-of-native pure-Dart research target was not reached:
+> per-sequence bit/copy overhead and XXH64 are the structural limits. Web keeps
+> the v0.1.2 engine (v2 is correct but slower there). The encoder covers levels
+> 1-19; levels 10-19 use a deeper-search lazy2 parser rather than `btopt`.
 
 ## Usage
 
 ```dart
 import 'dart:convert';
+import 'dart:typed_data';
 
 import 'package:zstd_neo/zstd_neo.dart';
 
@@ -32,6 +31,11 @@ void main() {
   final codec = ZstdCodec(level: 3);
   final compressed = codec.encode(input);
   final restored = codec.decode(compressed);
+
+  // Zero-allocation decode into a caller buffer (VM/AOT fast path):
+  final dst = Uint8List(restored.length + 128 * 1024);
+  final n = const ZstdDecoder().decompressInto(compressed, dst);
+  print(n);
 
   print(utf8.decode(restored)); // hello hello hello hello
 }
@@ -129,14 +133,16 @@ crate on 256 KiB Silesia slices at levels 3, 9 and 19, including ratios. It is
 generated and committed automatically by CI on the default branch; a missing
 series is omitted rather than faked.
 
-On the current runners, v0.1.2 improves the v0.1.1 numbers by roughly **1.55x**
-(AOT L3 encode), **1.85x** (L9) and **2.21x** (L19), while the decoder is about
-**1.3–1.5x** faster on AOT, **1.9x** on JS and **1.47x** on Wasm. The checksum path was also
-optimized (native XXH64 about 2x; JS/Wasm 1.55–1.8x). Compression ratios remain
-close to libzstd at levels 3 and 9 and about 6–8% behind at level 19, because the
-high levels approximate the reference `btopt` parser. Native C remains faster;
-the chart makes the trade-off explicit, and the JS decode numbers are partly
-checksum-bound because JavaScript has no native 64-bit integers.
+v0.2.0 switches the Dart VM/AOT one-shot path to a new v2 engine:
+`decompressInto` is roughly **1.4–1.6x** the v0.1.2 decoder (allocating
+`decompress` ~1.2–1.4x) and one-shot encode roughly **1.1x**.
+Measured throughput is about **37–40% of native** for decode and about **20%**
+for L3 encode; the 80%-of-native pure-Dart research target was not reached
+because per-sequence bit operations and the XXH64 checksum dominate at this
+point. Web keeps the v0.1.2 engine (v2 is correct but slower on JS/Wasm).
+Compression ratios remain close to libzstd at levels 3 and 9 and about 6–8%
+behind at level 19, because the high levels approximate `btopt`. Native C
+remains faster; the chart makes the trade-off explicit.
 
 ## Development
 

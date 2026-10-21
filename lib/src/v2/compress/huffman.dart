@@ -1,0 +1,406 @@
+import 'dart:typed_data';
+
+import 'bit_writer.dart';
+import 'byte_writer.dart';
+import 'fse_encoder.dart';
+
+/// Maximum Huffman code length allowed by the format specification.
+const int huffmanMaxBits = 11;
+
+/// A canonical Huffman compression table for literal bytes.
+///
+/// Codes are stored as the integer value of their `nbBits`-bit big-endian
+/// representation; when writing the (backwards) bitstream the low
+/// `nbBits` bits are appended least-significant first, which reproduces the
+/// on-wire order.
+final class HuffmanTable {
+  HuffmanTable._({
+    required this.maxSymbolValue,
+    required this.tableLog,
+    required this.bits,
+    required this.codes,
+    required this.weights,
+  });
+
+  /// Highest literal symbol with a non-zero weight.
+  final int maxSymbolValue;
+
+  /// Tree depth (`Max_Number_of_Bits`).
+  final int tableLog;
+
+  /// Number of bits per literal symbol (0 = absent), 256 entries.
+  final Uint8List bits;
+
+  /// Code value per literal symbol (only meaningful when `bits[s] > 0`).
+  final Uint16List codes;
+
+  /// Weight per literal symbol (0 = absent), 256 entries.
+  final Uint8List weights;
+
+  /// Whether this table can encode every non-zero entry of [counts].
+  bool canEncode(Uint32List counts) {
+    for (var s = 0; s < 256; s++) {
+      if (counts[s] != 0 && bits[s] == 0) return false;
+    }
+    return true;
+  }
+
+  /// Estimated encoded size in bits for [counts].
+  int estimateBits(Uint32List counts) {
+    var total = 0;
+    for (var s = 0; s < 256; s++) {
+      if (counts[s] != 0) total += counts[s] * bits[s];
+    }
+    return total;
+  }
+}
+
+/// Builds a length-limited Huffman table from a literal [counts] histogram.
+///
+/// Returns `null` when fewer than two symbols are present (the caller should
+/// emit RLE literals instead) or when no valid table could be produced.
+///
+/// [scratch] carries the package-merge node arrays between calls so that
+/// repeated blocks do not allocate thousands of temporary objects.
+HuffmanTable? buildHuffmanTable(Uint32List counts, {HuffmanScratch? scratch}) {
+  final symbols = <int>[];
+  for (var s = 0; s < 256; s++) {
+    if (counts[s] != 0) symbols.add(s);
+  }
+  if (symbols.length < 2) return null;
+  if (symbols.length > (1 << huffmanMaxBits)) return null;
+
+  final symbolArray = Int32List.fromList(symbols);
+  final freqs = Int32List(symbols.length);
+  for (var i = 0; i < symbols.length; i++) {
+    freqs[i] = counts[symbols[i]];
+  }
+  final scratchUsed = scratch ?? HuffmanScratch();
+  final lengths = _packageMergeLengths(
+    symbolArray,
+    freqs,
+    huffmanMaxBits,
+    scratchUsed,
+  );
+  if (lengths == null) return null;
+
+  var maxLen = 0;
+  for (final s in symbols) {
+    final len = lengths[s];
+    if (len < 1 || len > huffmanMaxBits) return null;
+    if (len > maxLen) maxLen = len;
+  }
+  if (maxLen == 0) return null;
+
+  // Kraft equality check: the weights must describe a complete tree.
+  var kraft = 0;
+  for (final s in symbols) {
+    kraft += 1 << (maxLen - lengths[s]);
+  }
+  if (kraft != (1 << maxLen)) return null;
+
+  final bits = Uint8List(256);
+  final codes = Uint16List(256);
+  final weights = Uint8List(256);
+  var maxSymbol = 0;
+  final nbPerRank = List<int>.filled(maxLen + 2, 0);
+  for (final s in symbols) {
+    bits[s] = lengths[s];
+    nbPerRank[lengths[s]]++;
+    if (s > maxSymbol) maxSymbol = s;
+  }
+  final valPerRank = List<int>.filled(maxLen + 2, 0);
+  var min = 0;
+  for (var n = maxLen; n > 0; n--) {
+    valPerRank[n] = min;
+    min += nbPerRank[n];
+    min >>= 1;
+  }
+  for (var s = 0; s <= maxSymbol; s++) {
+    final len = bits[s];
+    if (len == 0) continue;
+    codes[s] = valPerRank[len]++;
+    weights[s] = maxLen + 1 - len;
+  }
+  return HuffmanTable._(
+    maxSymbolValue: maxSymbol,
+    tableLog: maxLen,
+    bits: bits,
+    codes: codes,
+    weights: weights,
+  );
+}
+
+/// Encodes the Huffman tree description for [table].
+///
+/// Returns `null` when the table cannot be described (full alphabet with a
+/// weight series that does not compress); the caller then falls back to raw
+/// literals.
+Uint8List? writeHuffmanTreeDescription(HuffmanTable table) {
+  final maxSymbol = table.maxSymbolValue;
+  if (maxSymbol == 0) return null;
+  final weightCount = maxSymbol;
+  final weightSeries = Uint8List(weightCount);
+  for (var s = 0; s < weightCount; s++) {
+    weightSeries[s] = table.weights[s];
+  }
+
+  final fseCompressed = _compressWeights(weightSeries, weightCount);
+  if (fseCompressed != null &&
+      fseCompressed.length > 1 &&
+      fseCompressed.length < (maxSymbol >> 1)) {
+    final out = Uint8List(1 + fseCompressed.length);
+    out[0] = fseCompressed.length;
+    out.setRange(1, out.length, fseCompressed);
+    return out;
+  }
+
+  // Direct 4-bit representation works for alphabets up to 129 symbols.
+  if (maxSymbol > 128) return null;
+  final out = Uint8List(1 + ((weightCount + 1) >> 1));
+  out[0] = 127 + maxSymbol;
+  for (var i = 0; i < weightCount; i += 2) {
+    final w0 = weightSeries[i];
+    final w1 = i + 1 < weightCount ? weightSeries[i + 1] : 0;
+    out[1 + (i >> 1)] = (w0 << 4) | w1;
+  }
+  return out;
+}
+
+/// Encodes [count] literals from `src[start..end)` with [table].
+///
+/// [fourStreams] selects the 4-stream layout (mandatory above 1 KiB of
+/// literals); the 6-byte jump table is filled in afterwards.
+///
+/// [scratch] is reused across calls (and across blocks) to avoid allocating a
+/// bit accumulator for every literals section.
+Uint8List encodeHuffmanLiterals(
+  Uint8List src,
+  int start,
+  int end,
+  HuffmanTable table, {
+  required bool fourStreams,
+  BitWriter? scratch,
+}) {
+  final output = ByteWriter((end - start) + 32);
+  final writer = scratch ?? BitWriter((end - start) + 16);
+  writer.reset();
+  if (!fourStreams) {
+    _encodeSingleStream(output, src, start, end, table, writer);
+    return output.takeBytes();
+  }
+  output.writeUint16(0);
+  output.writeUint16(0);
+  output.writeUint16(0);
+  final sizes = List<int>.filled(3, 0);
+  final segmentSize = (end - start + 3) >> 2;
+  var offset = start;
+  for (var i = 0; i < 4; i++) {
+    final segmentEnd = i == 3 ? end : offset + segmentSize;
+    final written = _encodeSingleStream(
+      output,
+      src,
+      offset,
+      segmentEnd,
+      table,
+      writer,
+    );
+    if (i < 3) sizes[i] = written;
+    offset = segmentEnd;
+  }
+  for (var i = 0; i < 3; i++) {
+    if (sizes[i] > 0xFFFF) {
+      throw StateError('Huffman stream too large');
+    }
+    output.patchUint16(i * 2, sizes[i]);
+  }
+  return output.takeBytes();
+}
+
+int _encodeSingleStream(
+  ByteWriter output,
+  Uint8List src,
+  int start,
+  int end,
+  HuffmanTable table,
+  BitWriter writer,
+) {
+  for (var i = end - 1; i >= start; i--) {
+    final symbol = src[i];
+    final nbBits = table.bits[symbol];
+    if (nbBits == 0) {
+      throw StateError('Huffman table cannot encode symbol $symbol');
+    }
+    writer.addBits(table.codes[symbol], nbBits);
+  }
+  writer.finish();
+  final written = writer.length;
+  output.writeBytes(writer.bytes);
+  writer.reset();
+  return written;
+}
+
+Uint8List? _compressWeights(Uint8List weights, int count) {
+  if (count <= 1) return null;
+  var maxWeight = 0;
+  for (var i = 0; i < count; i++) {
+    if (weights[i] > maxWeight) maxWeight = weights[i];
+  }
+  final counts = Int32List(maxWeight + 1);
+  var maxCount = 0;
+  for (var i = 0; i < count; i++) {
+    final c = ++counts[weights[i]];
+    if (c > maxCount) maxCount = c;
+  }
+  if (maxCount == count || maxCount == 1) return null;
+  try {
+    final tableLog = fseOptimalTableLog(6, count, maxWeight, 1);
+    final normalized = fseNormalizeCounts(
+      count: counts,
+      maxSymbolValue: maxWeight,
+      total: count,
+      tableLog: tableLog,
+    );
+    final output = ByteWriter(64);
+    writeFseNCount(output, normalized, maxWeight, tableLog);
+    final table = FseCTable.fromNormalized(normalized, maxWeight, tableLog);
+    final bitWriter = BitWriter(count + 16);
+    encodeFseStreamTwoStates(bitWriter, table, weights);
+    bitWriter.finish();
+    output.writeBytes(bitWriter.bytes);
+    return output.takeBytes();
+  } on ArgumentError {
+    return null;
+  } on StateError {
+    return null;
+  }
+}
+
+// --- Package-merge length-limited Huffman code construction -----------------
+
+/// Reusable node storage for the package-merge algorithm.
+final class HuffmanScratch {
+  Int32List weights = Int32List(0);
+  Int32List left = Int32List(0);
+  Int32List right = Int32List(0);
+  Int32List symbol = Int32List(0);
+  Int32List stack = Int32List(0);
+  final Int32List lengths = Int32List(256);
+  final Int32List levelStart = Int32List(16);
+  final Int32List levelCount = Int32List(16);
+
+  void _ensure(int nodes) {
+    if (nodes <= weights.length) return;
+    final capacity = nodes * 2;
+    weights = Int32List(capacity);
+    left = Int32List(capacity);
+    right = Int32List(capacity);
+    symbol = Int32List(capacity);
+    stack = Int32List(capacity);
+  }
+}
+
+Int32List? _packageMergeLengths(
+  Int32List symbols,
+  Int32List frequencies,
+  int maxBits,
+  HuffmanScratch scratch,
+) {
+  final n = symbols.length;
+  if (n == 1) return null;
+  final needed = 2 * n - 2;
+  scratch._ensure((n * 3 + 4) * (maxBits + 2));
+  final weights = scratch.weights;
+  final left = scratch.left;
+  final right = scratch.right;
+  final nodeSymbol = scratch.symbol;
+  final levelStart = scratch.levelStart;
+  final levelCount = scratch.levelCount;
+  final lengths = scratch.lengths;
+  lengths.fillRange(0, 256, 0);
+
+  // Level 0: one leaf node per symbol, sorted by (frequency, symbol).
+  final order = List<int>.generate(n, (i) => i);
+  order.sort((a, b) {
+    final byWeight = frequencies[a].compareTo(frequencies[b]);
+    if (byWeight != 0) return byWeight;
+    return symbols[a].compareTo(symbols[b]);
+  });
+  for (var i = 0; i < n; i++) {
+    final source = order[i];
+    weights[i] = frequencies[source];
+    left[i] = -1;
+    right[i] = -1;
+    nodeSymbol[i] = symbols[source];
+  }
+  levelStart[0] = 0;
+  levelCount[0] = n;
+  var total = n;
+
+  for (var level = 1; level < maxBits; level++) {
+    final previousStart = levelStart[level - 1];
+    final previousCount = levelCount[level - 1];
+    final packageCount = previousCount >> 1;
+    final packageStart = total;
+    total += packageCount;
+    for (var i = 0; i < packageCount; i++) {
+      final a = previousStart + 2 * i;
+      final b = a + 1;
+      final node = packageStart + i;
+      weights[node] = weights[a] + weights[b];
+      left[node] = a;
+      right[node] = b;
+      nodeSymbol[node] = -1;
+    }
+    final mergedStart = total;
+    final mergedCount = n + packageCount;
+    total += mergedCount;
+    var coinIndex = 0;
+    var packageIndex = 0;
+    var out = mergedStart;
+    while (coinIndex < n || packageIndex < packageCount) {
+      final takeCoin =
+          packageIndex >= packageCount ||
+          (coinIndex < n &&
+              weights[coinIndex] <= weights[packageStart + packageIndex]);
+      if (takeCoin) {
+        weights[out] = weights[coinIndex];
+        left[out] = -1;
+        right[out] = -1;
+        nodeSymbol[out] = nodeSymbol[coinIndex];
+        coinIndex++;
+      } else {
+        final node = packageStart + packageIndex;
+        weights[out] = weights[node];
+        left[out] = left[node];
+        right[out] = right[node];
+        nodeSymbol[out] = -1;
+        packageIndex++;
+      }
+      out++;
+    }
+    levelStart[level] = mergedStart;
+    levelCount[level] = mergedCount;
+  }
+
+  final topStart = levelStart[maxBits - 1];
+  final topCount = levelCount[maxBits - 1];
+  if (topCount < needed) return null;
+
+  final stack = scratch.stack;
+  var stackSize = 0;
+  for (var i = 0; i < needed; i++) {
+    stack[stackSize++] = topStart + i;
+  }
+  while (stackSize > 0) {
+    final node = stack[--stackSize];
+    final decodedSymbol = nodeSymbol[node];
+    if (decodedSymbol >= 0) {
+      lengths[decodedSymbol]++;
+    } else {
+      stack[stackSize++] = left[node];
+      stack[stackSize++] = right[node];
+    }
+  }
+  return lengths;
+}

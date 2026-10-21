@@ -1,3 +1,20 @@
+## 0.2.0
+
+### v2 engine
+- New one-shot decoder engine with a 64-bit bit window, 4-symbol-unrolled
+  Huffman decode, packed FSE rows, fused sequence execution, specialized match
+  copies and an optimized XXH64. On the Dart VM/AOT `decompressInto` is ~1.4-1.6x the v0.1.2
+  decoder (allocating `decompress` ~1.2-1.4x) and reaches ~37-40% of native zstd; the 80%-of-native pure-Dart
+  research target was not reached (per-sequence overhead and checksum).
+- New one-shot encoder engine with word-based hashing and a leaner match loop;
+  ~1.1x the v0.1.2 encoder at equal ratio. Streaming keeps the v0.1.2 engine.
+- Web keeps the v0.1.2 engine: v2 is verified correct on JS/Wasm but slower
+  there.
+- Added `ZstdDecoder.decompressInto` for caller-provided output buffers.
+- Hardened the v2 decoder with malformed-input fuzzing, destination canaries
+  and the 278-frame conformance corpus.
+- Added v2 conformance/fuzz/web tests; full suite remains green.
+
 ## 0.1.2
 
 ### Conformance

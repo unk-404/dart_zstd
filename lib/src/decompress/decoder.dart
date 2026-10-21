@@ -4,11 +4,23 @@ import 'dart:typed_data';
 import '../common/constants.dart';
 import '../common/errors.dart';
 import '../common/xxh64.dart';
+import '../v2/decompress/decoder.dart';
 import 'bit_stream.dart';
 import 'block.dart';
 import 'dictionary.dart';
+import 'fast_flag.dart' if (dart.library.js_interop) 'fast_flag_web.dart';
+import 'fast_scan.dart';
 import 'frame.dart';
 import 'window.dart';
+
+/// Cached v2 engines keyed by the immutable decoder options object.
+///
+/// [ZstdDecoder] stays `const`, so the v2 scratch buffers live in an Expando
+/// rather than in a mutable field. The decoder is synchronous, so reuse is
+/// safe.
+final Expando<V2ZstdDecoder> _fastDecoders = Expando<V2ZstdDecoder>(
+  'zstd_neo.v2.decoder',
+);
 
 /// Streaming-capable Zstandard decoder.
 ///
@@ -42,8 +54,37 @@ final class ZstdDecoder extends Converter<List<int>, List<int>> {
   final int? maxOutputSize;
 
   /// Fast path: decompress a contiguous byte buffer.
+  ///
+  /// On the Dart VM this uses the v2 one-shot engine when every frame declares
+  /// its content size, which is the common case for files produced by
+  /// `zstd`/libzstd. Unknown-content-size and malformed inputs fall back to the
+  /// streaming engine, including its normal error reporting.
   Uint8List decompress(Uint8List input) {
     _checkConfiguration();
+    if (kUseFastDecoder) {
+      final total = fastOutputSize(input, maxWindowSize, maxOutputSize);
+      if (total != null) {
+        final fast = _fastDecoderFor(this);
+        final buffer = Uint8List(total + zstdBlockSizeMax);
+        try {
+          final written = fast.decodeInto(input, buffer);
+          if (written != total) {
+            throw const ZstdException(
+              ZstdErrorCode.invalidFrameHeader,
+              'decoded size does not match the declared frame content size',
+            );
+          }
+          return Uint8List.sublistView(buffer, 0, written);
+        } on ZstdException {
+          rethrow;
+        } catch (error) {
+          throw ZstdException(
+            ZstdErrorCode.invalidFrameHeader,
+            'corrupt zstd data: $error',
+          );
+        }
+      }
+    }
     try {
       return _decompressAll(input);
     } on ZstdException {
@@ -54,6 +95,76 @@ final class ZstdDecoder extends Converter<List<int>, List<int>> {
         'corrupt zstd data: $error',
       );
     }
+  }
+
+  /// Decompresses [input] directly into [output], starting at [outputOffset].
+  ///
+  /// This avoids the output allocation of [decompress]. The v2 fast path needs
+  /// up to one block (128 KiB) of slack after the expected output because a
+  /// block writes its maximum before its final length is known. When the
+  /// caller's buffer does not have that slack, the regular streaming engine is
+  /// used and the result is copied into [output].
+  int decompressInto(
+    Uint8List input,
+    Uint8List output, {
+    int outputOffset = 0,
+  }) {
+    _checkConfiguration();
+    if (outputOffset < 0 || outputOffset > output.length) {
+      throw ArgumentError.value(
+        outputOffset,
+        'outputOffset',
+        'must be within the output buffer',
+      );
+    }
+    if (kUseFastDecoder) {
+      final total = fastOutputSize(input, maxWindowSize, maxOutputSize);
+      if (total != null &&
+          total <= output.length - outputOffset - zstdBlockSizeMax) {
+        final fast = _fastDecoderFor(this);
+        try {
+          final written = fast.decodeInto(
+            input,
+            output,
+            dstOffset: outputOffset,
+          );
+          if (written != total) {
+            throw const ZstdException(
+              ZstdErrorCode.invalidFrameHeader,
+              'decoded size does not match the declared frame content size',
+            );
+          }
+          return written;
+        } on ZstdException {
+          rethrow;
+        } catch (error) {
+          throw ZstdException(
+            ZstdErrorCode.invalidFrameHeader,
+            'corrupt zstd data: $error',
+          );
+        }
+      }
+    }
+    final decoded = _decompressAll(input);
+    if (decoded.length > output.length - outputOffset) {
+      throw ZstdException(
+        ZstdErrorCode.outputTooLarge,
+        'decompressed size ${decoded.length} does not fit in the output buffer',
+      );
+    }
+    output.setRange(outputOffset, outputOffset + decoded.length, decoded);
+    return decoded.length;
+  }
+
+  static V2ZstdDecoder _fastDecoderFor(ZstdDecoder decoder) {
+    final dictionary = decoder.dictionary;
+    return _fastDecoders[decoder] ??= V2ZstdDecoder(
+      dictionary: dictionary != null && dictionary.isNotEmpty
+          ? dictionary
+          : null,
+      maxWindowSize: decoder.maxWindowSize,
+      verifyChecksum: decoder.verifyChecksum,
+    );
   }
 
   @override

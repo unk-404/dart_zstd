@@ -119,5 +119,27 @@ void main() {
         throwsA(isA<ZstdException>()),
       );
     });
+
+    test('decompressInto writes at the requested offset', () {
+      final expected = utf8.encode('decompress into a caller buffer ' * 40);
+      final frame = Uint8List.fromList(const ZstdCodec().encode(expected));
+      final output = Uint8List(7 + expected.length + 128 * 1024);
+      final written = const ZstdDecoder().decompressInto(
+        frame,
+        output,
+        outputOffset: 7,
+      );
+      expect(written, expected.length);
+      expect(output.sublist(7, 7 + written), expected);
+    });
+
+    test('decompressInto falls back when the buffer has no block slack', () {
+      final expected = utf8.encode('exact size destination');
+      final frame = Uint8List.fromList(const ZstdCodec().encode(expected));
+      final output = Uint8List(expected.length);
+      final written = const ZstdDecoder().decompressInto(frame, output);
+      expect(written, expected.length);
+      expect(output, expected);
+    });
   });
 }
