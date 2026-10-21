@@ -9,7 +9,7 @@ A from-scratch, **pure Dart** implementation of the
 - Streaming encoder with `Converter` / `startChunkedConversion`, plus a
   one-shot fast path.
 
-> **Status: v0.2.1.** The new v2 one-shot engine is the default on the Dart
+> **Status: v0.2.0.** The new v2 one-shot engine is the default on the Dart
 > VM/AOT: AOT `decompressInto` is roughly 1.4-1.6x the v0.1.2 decoder
 > (allocating `decompress` ~1.2-1.4x) and one-shot encode roughly 1.1x; measured throughput is about 37-40% of native zstd (decode) and
 > 20% (L3 encode). The 80%-of-native pure-Dart research target was not reached:
@@ -140,7 +140,7 @@ crate on 256 KiB Silesia slices at levels 3, 9 and 19, including ratios. It is
 generated and committed automatically by CI on the default branch; a missing
 series is omitted rather than faked.
 
-v0.2.1 switches the Dart VM/AOT one-shot path to a new v2 engine and uses
+v0.2.0 switches the Dart VM/AOT one-shot path to a new v2 engine and uses
 blit 0.2.1 `UnsafeBytes` for an externally owned decode buffer:
 `decompressInto` is roughly **1.4–1.6x** the v0.1.2 decoder, allocating
 `decompress` ~1.2–1.4x, `decompressUnsafe` about **1.2x faster than the managed
