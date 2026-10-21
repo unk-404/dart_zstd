@@ -132,4 +132,9 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git commit -m "chore(bench): refresh chart [skip ci]"
+          # Another push (e.g. a version/docs commit) may land while the
+          # benchmark runs. Rebase the chart commit before pushing so the
+          # chart job does not fail with a non-fast-forward rejection.
+          git fetch origin "${GITHUB_REF_NAME}"
+          git rebase "origin/${GITHUB_REF_NAME}"
           git push origin "HEAD:${GITHUB_REF_NAME}"
